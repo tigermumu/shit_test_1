@@ -131,7 +131,6 @@
 
 - 点差过大：任一市场 `spread_pct > 5%` → 不 executable
 - 流动性过小：`effective_usd < 100` → 不 executable
-- 时间漂移：Polymarket endDate 与 Deribit 交割时间偏差 `> 2h` → 不 executable
 
 其中：
 
@@ -152,22 +151,57 @@
   - 成本（USD）≈ `N * premium_usd`
   - 下跌保护（到期 S = K - ΔS）简化收益：`N * ΔS - N * premium_usd`
 
-在该简化模型下，用两个不等式求解：
+在该简化模型下，代码里对 N 区间的求解与解释如下（与 [solve_n_range](file:///f:/workshop/polymarket/polymarket_deribit/pda/orderbook.py#L201-L287) 完全一致）。
 
-- 上涨场景目标：
-  - `shares - budget_usd - N*premium_usd > target_profit_pct * Cost_total`
-- 下跌场景目标（保护深度 ΔS，默认 500）：
-  - `N*ΔS - budget_usd - N*premium_usd > target_profit_pct * Cost_total`
+记：
 
-其中 `Cost_total = budget_usd + N*premium_usd`。
+- `p = P_poly_ask`（Polymarket Yes 的 L1 ask 价格，0~1）
+- `q = P_deri_ask_premium_usd`（Deribit Put 的 L1 ask premium，已换算成 USD/contract）
+- `w = budget_usd`（本轮有效可成交规模 `effective_usd`）
+- `ds = ΔS`（保护深度，默认 500 USD）
+- `t = target_profit_pct`（目标利润率，例如 0.03）
+- `fee_pct = fees_pct_total`（总手续费/滑点的比例化近似，按 `(w + N*q)` 计提）
+- `m = max_deadzone_loss_pct`（允许的“最惨点”亏损占比上限，默认 15%）
 
-求解输出：
+并定义在“建议 N 下”的简化到期 PnL：
 
-- `n_min`：满足下跌场景目标的最小 N
-- `n_max`：满足上涨场景目标的最大 N（并受 Deribit L1 contracts 上限约束）
-- `suggested_n`：在 `[n_min, n_max]` 内取一个推荐值（当前实现以 `n_star = shares/ΔS` 为中心裁剪）
-- `worst_case_roi_pct`：按上述两场景的最差收益 / 成本
-- `expected_roi_pct`：用 `Prob(Above) ≈ 1 + delta_put` 做两状态期望 ROI（用于研究）
+- `shares = w / p`
+- `Fees(N) = fee_pct * (w + N*q)`
+- `Cost_total(N) = w + N*q + Fees(N)`
+- 上涨场景（S≥K）：`PnL_up(N) = (shares - w) - N*q - Fees(N)`
+- 下跌场景（S<K）：`PnL_down(S, N) = N*(K - S) - (w + N*q) - Fees(N)`
+
+代码的约束是：两种场景都要满足 `PnL > t * Cost_total`，由此推得区间：
+
+- `N_min = w*(1+t) / ( ds - q*(1+t) )`
+  - 需要 `ds - q*(1+t) > 0`，否则直接判定不可行（reason=`premium_too_high_for_protection`）
+- `N_max = w*( 1/p - 1 - t ) / ( q*(1+t) )`
+  - 需要 `1/p - 1 - t > 0`，否则直接判定不可行（reason=`poly_upside_not_enough`）
+- 若 Deribit L1 的合约数量上限为 `C1`，则 `N_max = min(N_max, C1)`（流动性约束）
+- 额外约束（避免“死区最惨点”过深）：在代码里用 `S=K` 的亏损占比上限 `m` 对 `N_max` 再做一次裁剪
+- 若 `N_min >= N_max`，判定不可行（reason=`no_feasible_n_range`）
+
+在可行区间存在时，代码会给一个推荐值：
+
+- `N_star = (w/p) / ds`（等价于 `shares / ds`）
+- `suggested_n = clamp(N_star, N_min, N_max)`
+
+并在 `suggested_n` 上做“全路径”压力测试（从 `K-2000` 到 `K+1000`，步长 50）：
+
+- 生成 `PnL(S)` 序列并取最小值：`worst_case_profit_usd = min_S PnL(S)`
+- `worst_case_roi_pct = worst_case_profit_usd / Cost_total(suggested_n) * 100`
+- 自动估算盈亏平衡点：
+  - `lower_breakeven`：`PnL(S)=0` 的下方根（若存在）
+  - `upper_breakeven`：`PnL(S)=0` 的上方根（若存在；在“买 Yes + 买 Put”的简化模型中可能不存在）
+- 计算“死区”：
+  - `max_loss_usd = |min_S PnL(S)|`
+  - `deadzone_width_usd`：包含 `S=K` 的那段连续负收益区间宽度
+- 期望值（研究用）：
+  - `expected_profit_usd = p_above*PnL_up(suggested_n) + (1-p_above)*PnL_down(K-2000, suggested_n)`
+  - `expected_roi_pct = expected_profit_usd / Cost_total(suggested_n) * 100`
+  - 其中 `p_above` 来自 `Prob(Above) ≈ 1 + delta_put`（若不在 0~1 则期望值不计算）
+- 可执行判定（Zenith 升级版）：
+  - 当前价格（用 Deribit `index_price` 代理）落在盈利区间，或 `deadzone_width_usd <= 400` 才标记 `is_executable=true`
 
 实现位置：
 
@@ -314,6 +348,7 @@ Zenith 求解/过滤参数：
   - 目前只做点差过滤与 L1 深度约束
 - Shadow Trades 的持久化：
   - 内存 + 导出 CSV；在 Railway 上更建议后续接 Redis/SQLite/对象存储做长期留存
-- 时间对齐：
-  - Polymarket endDate 与 Deribit expiry 的 mapping 目前是固定假设（可进一步从 Deribit instrument 元数据精确取交割时间）
-
+- 时间对齐（待做）：
+  - 先不作为 executable 过滤条件，但需要持续记录与观察
+  - 后续可加入过滤：Polymarket endDate 与 Deribit 交割时间偏差 `> 2h` 则放弃
+  - 交割时间建议从 Deribit instrument 元数据精确获取，而不是固定假设

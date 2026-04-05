@@ -20,6 +20,8 @@ from .orderbook import (
     normalize_polymarket_levels,
     simulate_buy_by_budget,
     simulate_sell_qty,
+    payoff_curve,
+    payoff_metrics,
     solve_n_range,
     summarize_levels,
 )
@@ -99,6 +101,9 @@ def _collector_loop() -> None:
     delta_s_usd = float(os.getenv("PDA_DELTA_S_USD", "500"))
     target_profit_pct = float(os.getenv("PDA_TARGET_PROFIT_PCT", "0.03"))
     max_shadow_trades = int(os.getenv("PDA_MAX_SHADOW_TRADES", "50"))
+    fees_pct_total = float(os.getenv("PDA_FEES_PCT_TOTAL", "0.0"))
+    max_deadzone_loss_pct = float(os.getenv("PDA_MAX_DEADZONE_LOSS_PCT", "0.15"))
+    deadzone_max_width_usd = float(os.getenv("PDA_DEADZONE_MAX_WIDTH_USD", "400"))
 
     position_id = f"{currency}-{strike}-{date_iso}"
 
@@ -116,6 +121,9 @@ def _collector_loop() -> None:
             "delta_s_usd": delta_s_usd,
             "target_profit_pct": target_profit_pct,
             "max_shadow_trades": max_shadow_trades,
+            "fees_pct_total": fees_pct_total,
+            "max_deadzone_loss_pct": max_deadzone_loss_pct,
+            "deadzone_max_width_usd": deadzone_max_width_usd,
             "poll_s": poll_s,
             "depth": depth,
             "csv_path": csv_path,
@@ -215,10 +223,15 @@ def _collector_loop() -> None:
                     poly_ask_price=poly_ask_price,
                     deribit_ask_premium_usd=float(deri_ask_premium_usd),
                     budget_usd=float(effective_usd),
+                    strike=float(strike),
+                    current_price=deri_index,
                     delta_s_usd=float(delta_s_usd),
                     target_profit_pct=float(target_profit_pct),
                     deribit_max_contracts=deri_ask_contracts,
                     prob_above=deribit_prob_above,
+                    fees_pct_total=float(fees_pct_total),
+                    max_deadzone_loss_pct=float(max_deadzone_loss_pct),
+                    deadzone_max_width_usd=float(deadzone_max_width_usd),
                 )
 
             executable = bool(
@@ -228,7 +241,6 @@ def _collector_loop() -> None:
                 and effective_usd >= 100.0
                 and (poly_spread_pct is None or poly_spread_pct <= 0.05)
                 and (deri_spread_pct is None or deri_spread_pct <= 0.05)
-                and (drift_hours is None or drift_hours <= 2.0)
             )
 
             gap = (poly_sum.mid - deribit_prob_above) if (poly_sum.mid is not None and deribit_prob_above is not None) else None
@@ -261,7 +273,8 @@ def _collector_loop() -> None:
                 trade_id = f"{position_id}|{_shadow_trade_seq}"
                 shares = float(effective_usd) / float(poly_ask_price)
                 n = float(nres.suggested_n)
-                cost = float(effective_usd) + n * float(deri_ask_premium_usd)
+                fee_usd = float(fees_pct_total) * (float(effective_usd) + n * float(deri_ask_premium_usd))
+                cost = float(effective_usd) + n * float(deri_ask_premium_usd) + fee_usd
                 entry = {
                     "trade_id": trade_id,
                     "entry_ts_utc": ts,
@@ -272,10 +285,18 @@ def _collector_loop() -> None:
                     "deribit_ask_premium_usd": float(deri_ask_premium_usd),
                     "deribit_contracts": n,
                     "initial_cost_usd": cost,
+                    "fees_usd": fee_usd,
+                    "strike": float(strike),
                     "n_min": nres.n_min,
                     "n_max": nres.n_max,
                     "worst_case_roi_pct": nres.worst_case_roi_pct,
                     "expected_roi_pct": nres.expected_roi_pct,
+                    "lower_breakeven": nres.lower_breakeven,
+                    "upper_breakeven": nres.upper_breakeven,
+                    "max_loss_usd": nres.max_loss_usd,
+                    "deadzone_width_usd": nres.deadzone_width_usd,
+                    "plateau_profit_usd": nres.plateau_profit_usd,
+                    "score": nres.score,
                 }
                 _shadow_trades[trade_id] = entry
                 if len(_shadow_trades) > max_shadow_trades:
@@ -459,6 +480,65 @@ def export_collector_csv() -> StreamingResponse:
     return StreamingResponse(_iter(), media_type="text/csv; charset=utf-8", headers=headers)
 
 
+@app.get("/api/v1/payoff")
+def get_payoff(
+    trade_id: str | None = Query(default=None),
+    scan_lower: float = Query(default=2000.0, ge=100.0, le=10000.0),
+    scan_upper: float = Query(default=1000.0, ge=100.0, le=10000.0),
+    scan_step: float = Query(default=50.0, ge=1.0, le=500.0),
+) -> dict[str, Any]:
+    with _collector_lock:
+        entry = _collector_entry.copy() if isinstance(_collector_entry, dict) else None
+        trade = _shadow_trades.get(trade_id) if trade_id else None
+
+    if trade:
+        k = float(trade.get("strike") or SETTINGS.default_strike)
+        w = float(trade.get("budget_usd") or 0.0)
+        p = float(trade.get("poly_ask_entry") or 0.0)
+        shares = float(trade.get("poly_shares") or 0.0)
+        n = float(trade.get("deribit_contracts") or 0.0)
+        q = float(trade.get("deribit_ask_premium_usd") or 0.0)
+        fees_usd = float(trade.get("fees_usd") or 0.0)
+        current_price = _safe_float(entry.get("deribit_index_price")) if entry else None
+    else:
+        if not entry:
+            raise HTTPException(status_code=503, detail="collector_not_ready")
+        n_range = entry.get("n_range") if isinstance(entry.get("n_range"), dict) else None
+        if not n_range or n_range.get("suggested_n") is None:
+            raise HTTPException(status_code=503, detail="n_range_not_available")
+        k = float(SETTINGS.default_strike)
+        w = float(entry.get("effective_usd") or 0.0)
+        p = float(entry.get("poly_l1_ask") or 0.0)
+        shares = w / p if p > 0 else 0.0
+        n = float(n_range.get("suggested_n") or 0.0)
+        q = float(entry.get("deribit_l1_ask_premium_usd") or 0.0)
+        fee_pct = float((_collector_config or {}).get("fees_pct_total") or 0.0)
+        fees_usd = fee_pct * (w + n * q)
+        current_price = _safe_float(entry.get("deribit_index_price"))
+
+    curve = payoff_curve(
+        k=k,
+        shares=shares,
+        w=w,
+        n=n,
+        premium_usd=q,
+        fees_usd=fees_usd,
+        s_min=k - float(scan_lower),
+        s_max=k + float(scan_upper),
+        step=float(scan_step),
+    )
+    metrics = payoff_metrics(curve=curve, k=k, current_price=current_price)
+    return {
+        "trade_id": trade_id,
+        "strike": k,
+        "budget_usd": w,
+        "n": n,
+        "fees_usd": fees_usd,
+        "curve": [{"s": s, "pnl": pnl} for s, pnl in curve],
+        "metrics": metrics,
+    }
+
+
 @app.get("/api/v1/orderbooks")
 def get_orderbooks(
     date_iso: str = Query(default=SETTINGS.default_date_iso),
@@ -587,6 +667,7 @@ def dashboard() -> HTMLResponse:
       .newrow { background:#e8f5ff; animation: fadebg 1.8s ease-out; }
       @keyframes fadebg { 0% { background:#e8f5ff; } 100% { background:transparent; } }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   </head>
   <body>
     <h2>PDA 实时监控</h2>
@@ -602,6 +683,16 @@ def dashboard() -> HTMLResponse:
     <div class="card" style="margin-top: 12px;">
       <div><b>KPI</b> <span id="err" class="bad"></span></div>
       <div class="kpi" id="kpi"></div>
+    </div>
+    <div class="card" style="margin-top: 12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><b>Payoff Chart</b> <span class="k">selected:</span> <span id="payoffSelected" class="mono">CURRENT</span></div>
+        <div>
+          <a class="btn" href="#" id="payoffReset">回到当前盘口</a>
+        </div>
+      </div>
+      <div id="payoffMeta" class="mono" style="margin-top:8px;"></div>
+      <canvas id="payoff" width="1200" height="260"></canvas>
     </div>
     <div class="card" style="margin-top: 12px;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -692,6 +783,11 @@ def dashboard() -> HTMLResponse:
           ['suggested_n', nRange && nRange.suggested_n !== undefined ? fmt(nRange.suggested_n) : ''],
           ['worst_case_roi_pct', nRange && nRange.worst_case_roi_pct !== undefined ? fmtPct(nRange.worst_case_roi_pct) : ''],
           ['expected_roi_pct', nRange && nRange.expected_roi_pct !== undefined ? fmtPct(nRange.expected_roi_pct) : ''],
+          ['deadzone_width', nRange && nRange.deadzone_width_usd !== undefined ? fmtUsd(nRange.deadzone_width_usd) : ''],
+          ['max_loss_usd', nRange && nRange.max_loss_usd !== undefined ? fmtUsd(nRange.max_loss_usd) : ''],
+          ['lower_bep', nRange && nRange.lower_breakeven !== undefined ? fmt(nRange.lower_breakeven) : ''],
+          ['upper_bep', nRange && nRange.upper_breakeven !== undefined ? fmt(nRange.upper_breakeven) : ''],
+          ['pda_score', nRange && nRange.score !== undefined ? fmt(nRange.score) : ''],
           ['gap', fmt(scan.gap)],
           ['shadow_trades', String(scan.shadow_trades)]
         ];
@@ -758,6 +854,49 @@ def dashboard() -> HTMLResponse:
         ctx.fillText('0%', pad + w - 18, y0 - 2);
         ctx.fillText('10%', pad + w - 24, y10 - 2);
       }
+
+      window.__payoff = window.__payoff || { chart: null, selected: null, lastTradeId: null };
+
+      function renderPayoff(data) {
+        const meta = document.getElementById('payoffMeta');
+        const selected = document.getElementById('payoffSelected');
+        const tradeId = data && data.trade_id ? data.trade_id : null;
+        selected.textContent = tradeId || 'CURRENT';
+        const m = (data && data.metrics) || {};
+        const lines = [
+          `strike=${fmt(data.strike)} budget_usd=${fmtUsd(data.budget_usd)} n=${fmt(data.n)} fees_usd=${fmtUsd(data.fees_usd)}`,
+          `max_loss_usd=${fmtUsd(m.max_loss_usd)} deadzone_width_usd=${fmtUsd(m.deadzone_width_usd)} lower_bep=${fmt(m.lower_breakeven)} upper_bep=${fmt(m.upper_breakeven)}`
+        ];
+        meta.textContent = lines.join('\\n');
+        const pts = (data.curve || []).map(p => ({ x: Number(p.s), y: Number(p.pnl) }));
+        const ctx = document.getElementById('payoff').getContext('2d');
+        if (!window.__payoff.chart) {
+          window.__payoff.chart = new Chart(ctx, {
+            type: 'line',
+            data: { datasets: [{ label: 'PnL (USD)', data: pts, borderColor: '#0066cc', borderWidth: 2, pointRadius: 0 }] },
+            options: {
+              animation: false,
+              responsive: false,
+              scales: {
+                x: { type: 'linear', title: { display: true, text: 'BTC Expiry Price' } },
+                y: { title: { display: true, text: 'PnL (USD)' } }
+              },
+              plugins: { legend: { display: false } }
+            }
+          });
+        } else {
+          window.__payoff.chart.data.datasets[0].data = pts;
+          window.__payoff.chart.update();
+        }
+      }
+
+      async function updatePayoff(tradeId) {
+        const q = tradeId ? ('?trade_id=' + encodeURIComponent(tradeId)) : '';
+        const data = await fetch('/api/v1/payoff' + q).then(r => r.json());
+        renderPayoff(data);
+        window.__payoff.selected = tradeId || null;
+      }
+
       async function tick() {
         const t0 = performance.now();
         window.__meta = window.__meta || { pollMs: 5000, lastTickAt: 0, nextAt: 0 };
@@ -797,6 +936,11 @@ def dashboard() -> HTMLResponse:
           const tr = document.createElement('tr');
           const k = r.ts_utc + '|' + r.trade_id;
           if (newly.has(k)) tr.className = 'newrow';
+          tr.style.cursor = 'pointer';
+          tr.onclick = () => {
+            window.__payoff.selected = r.trade_id;
+            updatePayoff(r.trade_id);
+          };
           const cols = [
             r.ts_utc,
             fmt(r.trade_id),
@@ -840,6 +984,10 @@ def dashboard() -> HTMLResponse:
           hb.className = 'dot live pulse';
           status.textContent = 'LIVE';
         }
+
+        if (!window.__payoff.selected) {
+          updatePayoff(null);
+        }
       }
       tick();
       window.__meta = window.__meta || { pollMs: 5000, lastTickAt: 0, nextAt: 0 };
@@ -853,6 +1001,12 @@ def dashboard() -> HTMLResponse:
         const hb = document.getElementById('hb');
         if (hb && hb.className.indexOf('pulse') === -1) hb.className += ' pulse';
       }, 250);
+
+      document.getElementById('payoffReset').onclick = (e) => {
+        e.preventDefault();
+        window.__payoff.selected = null;
+        updatePayoff(null);
+      };
     </script>
   </body>
 </html>
