@@ -576,10 +576,29 @@ def dashboard() -> HTMLResponse:
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
       .btn { display: inline-block; padding: 6px 10px; border: 1px solid #ddd; background: #fafafa; text-decoration: none; color: #333; border-radius: 4px; }
       .btn:hover { background: #f0f0f0; }
+      .topbar { display:flex; gap:12px; align-items:center; padding:8px 10px; border:1px solid #ddd; background:#fcfcfc; margin-top:10px; }
+      .pill { display:inline-flex; align-items:center; gap:8px; padding:4px 8px; border:1px solid #eee; border-radius:999px; background:#fff; font-size:12px; }
+      .dot { width:10px; height:10px; border-radius:50%; background:#999; display:inline-block; }
+      .dot.live { background:#2e7d32; }
+      .dot.warn { background:#f9a825; }
+      .dot.bad { background:#b00020; }
+      .pulse { animation: pulse 1.2s ease-in-out infinite; }
+      @keyframes pulse { 0% { transform: scale(0.85); opacity: 0.6; } 50% { transform: scale(1.2); opacity: 1; } 100% { transform: scale(0.85); opacity: 0.6; } }
+      .newrow { background:#e8f5ff; animation: fadebg 1.8s ease-out; }
+      @keyframes fadebg { 0% { background:#e8f5ff; } 100% { background:transparent; } }
     </style>
   </head>
   <body>
     <h2>PDA 实时监控</h2>
+    <div class="topbar">
+      <span class="pill"><span id="hb" class="dot"></span><span id="status">INIT</span></span>
+      <span class="pill">last_update: <span id="lastUpdate">-</span></span>
+      <span class="pill">next_refresh_in: <span id="nextIn">-</span>s</span>
+      <span class="pill">rows: <span id="rowCount">0</span></span>
+      <span class="pill">shadow_trades: <span id="shadowCount">0</span></span>
+      <span class="pill">fetch_ms: <span id="fetchMs">-</span></span>
+      <span class="pill">render_ms: <span id="renderMs">-</span></span>
+    </div>
     <div class="card" style="margin-top: 12px;">
       <div><b>KPI</b> <span id="err" class="bad"></span></div>
       <div class="kpi" id="kpi"></div>
@@ -740,29 +759,44 @@ def dashboard() -> HTMLResponse:
         ctx.fillText('10%', pad + w - 24, y10 - 2);
       }
       async function tick() {
+        const t0 = performance.now();
+        window.__meta = window.__meta || { pollMs: 5000, lastTickAt: 0, nextAt: 0 };
+        const hb = document.getElementById('hb');
+        const status = document.getElementById('status');
+        hb.className = 'dot warn pulse';
+        status.textContent = 'FETCHING';
+
         const [cfg, latest, rows] = await Promise.all([
           fetch('/api/v1/collector/config').then(r=>r.json()),
           fetch('/api/v1/collector/latest').then(r=>r.json()),
           fetch('/api/v1/collector/rows?limit=200').then(r=>r.json()),
         ]);
+        const t1 = performance.now();
+        document.getElementById('fetchMs').textContent = Math.round(t1 - t0);
         document.getElementById('cfg').textContent = JSON.stringify(cfg, null, 2);
         const le = (rows && rows.last_error) || (latest && latest.last_error) || (cfg && cfg.last_error);
         document.getElementById('err').textContent = le ? ('collector_error: ' + le) : '';
         setKpi(cfg.entry, latest.latest);
+        document.getElementById('shadowCount').textContent = cfg && cfg.entry && cfg.entry.shadow_trades ? String(cfg.entry.shadow_trades) : '0';
         const tbody = document.getElementById('rows');
         window.__seen = window.__seen || new Set();
         window.__buf = window.__buf || [];
+        const newly = new Set();
         (rows.rows || []).forEach(r=>{
           const k = r.ts_utc + '|' + r.trade_id;
           if (window.__seen.has(k)) return;
           window.__seen.add(k);
           window.__buf.push(r);
+          newly.add(k);
         });
         window.__buf.sort((a,b)=> String(a.ts_utc).localeCompare(String(b.ts_utc)));
         const renderRows = window.__buf.slice(-500).slice().reverse();
         tbody.innerHTML = '';
+        const r0 = performance.now();
         renderRows.slice(0, 200).forEach(r=>{
           const tr = document.createElement('tr');
+          const k = r.ts_utc + '|' + r.trade_id;
+          if (newly.has(k)) tr.className = 'newrow';
           const cols = [
             r.ts_utc,
             fmt(r.trade_id),
@@ -792,9 +826,33 @@ def dashboard() -> HTMLResponse:
         });
         const chartPoints = window.__buf.slice(-300).map(r=>Number(r.mark_roi_pct || 0));
         drawChart(chartPoints);
+        const r1 = performance.now();
+        document.getElementById('renderMs').textContent = Math.round(r1 - r0);
+
+        window.__meta.lastTickAt = Date.now();
+        window.__meta.nextAt = window.__meta.lastTickAt + window.__meta.pollMs;
+        document.getElementById('lastUpdate').textContent = new Date(window.__meta.lastTickAt).toISOString();
+        document.getElementById('rowCount').textContent = String(window.__buf.length);
+        if (le) {
+          hb.className = 'dot bad pulse';
+          status.textContent = 'ERROR';
+        } else {
+          hb.className = 'dot live pulse';
+          status.textContent = 'LIVE';
+        }
       }
       tick();
-      setInterval(tick, 5000);
+      window.__meta = window.__meta || { pollMs: 5000, lastTickAt: 0, nextAt: 0 };
+      window.__meta.pollMs = 5000;
+      setInterval(tick, window.__meta.pollMs);
+      setInterval(() => {
+        if (!window.__meta) return;
+        const now = Date.now();
+        const nextIn = window.__meta.nextAt ? Math.max(0, Math.ceil((window.__meta.nextAt - now) / 1000)) : 0;
+        document.getElementById('nextIn').textContent = String(nextIn);
+        const hb = document.getElementById('hb');
+        if (hb && hb.className.indexOf('pulse') === -1) hb.className += ' pulse';
+      }, 250);
     </script>
   </body>
 </html>
