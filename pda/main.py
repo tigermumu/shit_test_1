@@ -58,6 +58,15 @@ def _safe_float(x: Any) -> float | None:
         return None
 
 
+def _fmt_float(x: Any, decimals: int = 6, thousands: bool = False) -> str:
+    v = _safe_float(x)
+    if v is None:
+        return ""
+    if thousands:
+        return f"{v:,.{decimals}f}"
+    return f"{v:.{decimals}f}"
+
+
 def _append_csv_row(path: str, row: dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -376,23 +385,27 @@ def _render_levels(title: str, bids: list[dict[str, float]], asks: list[dict[str
     for i in range(max_len):
         b = bids[i] if i < len(bids) else None
         a = asks[i] if i < len(asks) else None
-        b_usd = "" if b is None else b.get("notional_usd")
-        a_usd = "" if a is None else a.get("notional_usd")
+        b_usd = "" if b is None else _fmt_float(b.get("notional_usd"), decimals=2, thousands=True)
+        a_usd = "" if a is None else _fmt_float(a.get("notional_usd"), decimals=2, thousands=True)
+        b_cum = "" if b is None else _fmt_float(b.get("cum_notional_usd"), decimals=2, thousands=True)
+        a_cum = "" if a is None else _fmt_float(a.get("cum_notional_usd"), decimals=2, thousands=True)
         rows.append(
             "<tr>"
-            f"<td>{'' if b is None else b['price']}</td>"
-            f"<td>{'' if b is None else b['size']}</td>"
+            f"<td>{'' if b is None else _fmt_float(b['price'], decimals=4)}</td>"
+            f"<td>{'' if b is None else _fmt_float(b['size'], decimals=4)}</td>"
             f"<td>{b_usd}</td>"
-            f"<td>{'' if a is None else a['price']}</td>"
-            f"<td>{'' if a is None else a['size']}</td>"
+            f"<td>{b_cum}</td>"
+            f"<td>{'' if a is None else _fmt_float(a['price'], decimals=4)}</td>"
+            f"<td>{'' if a is None else _fmt_float(a['size'], decimals=4)}</td>"
             f"<td>{a_usd}</td>"
+            f"<td>{a_cum}</td>"
             "</tr>"
         )
 
     return (
         f"<h3>{title}</h3>"
         "<table border='1' cellpadding='6' cellspacing='0'>"
-        "<thead><tr><th>Bid Px</th><th>Bid Sz</th><th>Bid USD</th><th>Ask Px</th><th>Ask Sz</th><th>Ask USD</th></tr></thead>"
+        "<thead><tr><th>Bid Px</th><th>Bid Sz</th><th>Bid USD</th><th>Bid Cum USD</th><th>Ask Px</th><th>Ask Sz</th><th>Ask USD</th><th>Ask Cum USD</th></tr></thead>"
         "<tbody>"
         + "".join(rows)
         + "</tbody></table>"
@@ -412,11 +425,21 @@ def dashboard() -> HTMLResponse:
       th { background: #f5f5f5; }
       .row { display: flex; gap: 16px; }
       .card { border: 1px solid #ddd; padding: 10px; flex: 1; }
+      .kpi { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+      .kpi > div { border: 1px solid #eee; padding: 8px; }
+      .k { color: #666; font-size: 11px; }
+      .v { font-size: 14px; font-weight: 700; }
+      .bad { color: #b00020; }
+      .good { color: #006400; }
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
     </style>
   </head>
   <body>
     <h2>PDA 实时监控</h2>
+    <div class="card" style="margin-top: 12px;">
+      <div><b>KPI</b> <span id="err" class="bad"></span></div>
+      <div class="kpi" id="kpi"></div>
+    </div>
     <div class="row">
       <div class="card">
         <div><b>Latest</b></div>
@@ -442,6 +465,8 @@ def dashboard() -> HTMLResponse:
             <th>roi_pct</th>
             <th>gap</th>
             <th>poly_spread</th>
+            <th>poly_best_bid</th>
+            <th>poly_best_ask</th>
             <th>poly_buy_slip_1500</th>
             <th>poly_buy_slip_5000</th>
             <th>deribit_index</th>
@@ -455,10 +480,70 @@ def dashboard() -> HTMLResponse:
       </table>
     </div>
     <script>
+      const nfUsd = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const nfNum = new Intl.NumberFormat('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 6 });
+      const nfPx = new Intl.NumberFormat('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+      const nfPct = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       function fmt(x) {
         if (x === null || x === undefined) return '';
-        if (typeof x === 'number') return x.toFixed(6);
+        if (typeof x === 'number') return nfNum.format(x);
         return String(x);
+      }
+      function fmtUsd(x) {
+        if (x === null || x === undefined) return '';
+        const n = Number(x);
+        if (!Number.isFinite(n)) return '';
+        return nfUsd.format(n);
+      }
+      function fmtPx(x) {
+        if (x === null || x === undefined) return '';
+        const n = Number(x);
+        if (!Number.isFinite(n)) return '';
+        return nfPx.format(n);
+      }
+      function fmtPct(x) {
+        if (x === null || x === undefined) return '';
+        const n = Number(x);
+        if (!Number.isFinite(n)) return '';
+        return nfPct.format(n) + '%';
+      }
+      function setKpi(latest) {
+        const el = document.getElementById('kpi');
+        el.innerHTML = '';
+        if (!latest) return;
+        const items = [
+          ['position_id', latest.position_id],
+          ['invest_usd', fmtUsd(latest.invest_usd)],
+          ['value_now_usd', fmtUsd(latest.value_now_usd)],
+          ['pnl_usd', fmtUsd(latest.pnl_usd)],
+          ['roi_pct', fmtPct(latest.roi_pct)],
+          ['gap', fmt(latest.gap)],
+          ['poly_best_bid', fmtPx(latest.poly_best_bid)],
+          ['poly_best_ask', fmtPx(latest.poly_best_ask)],
+          ['poly_spread', fmtPx(latest.poly_spread)],
+          ['slip_1500', fmtPx(latest.poly_buy_slip_1500)],
+          ['slip_5000', fmtPx(latest.poly_buy_slip_5000)],
+          ['deribit_index', fmtUsd(latest.deribit_index_price)],
+          ['deri_spread_usd', fmtUsd(latest.deribit_spread_usd)],
+          ['deri_delta', fmt(latest.deribit_delta)],
+          ['deri_theta', fmt(latest.deribit_theta)]
+        ];
+        items.forEach(([k,v])=>{
+          const d = document.createElement('div');
+          const kk = document.createElement('div');
+          kk.className = 'k';
+          kk.textContent = k;
+          const vv = document.createElement('div');
+          vv.className = 'v';
+          vv.textContent = v;
+          if (k === 'pnl_usd' || k === 'roi_pct') {
+            const n = Number(k === 'pnl_usd' ? latest.pnl_usd : latest.roi_pct);
+            if (Number.isFinite(n)) vv.className = 'v ' + (n >= 0 ? 'good' : 'bad');
+          }
+          d.appendChild(kk);
+          d.appendChild(vv);
+          el.appendChild(d);
+        });
       }
       function drawChart(points) {
         const c = document.getElementById('chart');
@@ -475,6 +560,20 @@ def dashboard() -> HTMLResponse:
         const ySpan = (ymax - ymin) || 1;
         ctx.strokeStyle = '#333';
         ctx.strokeRect(pad,pad,w,h);
+        const y0 = pad + h - (h * ((0 - ymin)/ySpan));
+        ctx.beginPath();
+        ctx.moveTo(pad, y0);
+        ctx.lineTo(pad + w, y0);
+        ctx.strokeStyle = '#ddd';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        const y10 = pad + h - (h * ((10 - ymin)/ySpan));
+        ctx.beginPath();
+        ctx.moveTo(pad, y10);
+        ctx.lineTo(pad + w, y10);
+        ctx.strokeStyle = '#ffcc00';
+        ctx.lineWidth = 1;
+        ctx.stroke();
         ctx.beginPath();
         ys.forEach((y,i)=>{
           const px = pad + (w * (i/(ys.length-1 || 1)));
@@ -488,6 +587,8 @@ def dashboard() -> HTMLResponse:
         ctx.fillText('roi_pct', pad+4, pad+12);
         ctx.fillText(fmt(ymin), pad+4, pad+h-2);
         ctx.fillText(fmt(ymax), pad+4, pad+24);
+        ctx.fillText('0%', pad + w - 18, y0 - 2);
+        ctx.fillText('10%', pad + w - 24, y10 - 2);
       }
       async function tick() {
         const [cfg, latest, rows] = await Promise.all([
@@ -497,19 +598,34 @@ def dashboard() -> HTMLResponse:
         ]);
         document.getElementById('cfg').textContent = JSON.stringify(cfg, null, 2);
         document.getElementById('latest').textContent = JSON.stringify(latest, null, 2);
+        const le = (rows && rows.last_error) || (latest && latest.last_error) || (cfg && cfg.last_error);
+        document.getElementById('err').textContent = le ? ('collector_error: ' + le) : '';
+        setKpi(latest.latest);
         const tbody = document.getElementById('rows');
         tbody.innerHTML = '';
         const rs = (rows.rows || []).slice().reverse().slice(0, 50);
         rs.forEach(r=>{
           const tr = document.createElement('tr');
           const cols = [
-            r.ts_utc, r.value_now_usd, r.pnl_usd, r.roi_pct, r.gap, r.poly_spread,
-            r.poly_buy_slip_1500, r.poly_buy_slip_5000, r.deribit_index_price, r.deribit_spread_usd,
-            r.deribit_delta, r.deribit_theta, r.note
+            r.ts_utc,
+            fmtUsd(r.value_now_usd),
+            fmtUsd(r.pnl_usd),
+            fmtPct(r.roi_pct),
+            fmt(r.gap),
+            fmtPx(r.poly_spread),
+            fmtPx(r.poly_best_bid),
+            fmtPx(r.poly_best_ask),
+            fmtPx(r.poly_buy_slip_1500),
+            fmtPx(r.poly_buy_slip_5000),
+            fmtUsd(r.deribit_index_price),
+            fmtUsd(r.deribit_spread_usd),
+            fmt(r.deribit_delta),
+            fmt(r.deribit_theta),
+            fmt(r.note)
           ];
           cols.forEach(v=>{
             const td = document.createElement('td');
-            td.textContent = fmt(v);
+            td.textContent = v;
             tr.appendChild(td);
           });
           tbody.appendChild(tr);
@@ -553,6 +669,8 @@ def index(
 
     poly_sum = data["polymarket"]["summary"]
     deri_sum = data["deribit"]["summary"]
+    poly_depth = data["polymarket"]["depth_usd"]
+    deribit_depth = data["deribit"]["depth_usd"]
 
     html = (
         "<html><head><meta charset='utf-8'/>"
@@ -563,14 +681,17 @@ def index(
         "<h3>Polymarket</h3>"
         f"<div>question={poly_target.get('question','')}</div>"
         f"<div>yes_token_id={poly_target.get('yes_token_id')}</div>"
-        f"<div>best_bid={poly_sum.get('best_bid')} best_ask={poly_sum.get('best_ask')} mid={poly_sum.get('mid')}</div>"
+        f"<div>best_bid={_fmt_float(poly_sum.get('best_bid'),decimals=4)} best_ask={_fmt_float(poly_sum.get('best_ask'),decimals=4)} mid={_fmt_float(poly_sum.get('mid'),decimals=4)} spread={_fmt_float(_safe_float(poly_sum.get('best_ask')) - _safe_float(poly_sum.get('best_bid')) if (poly_sum.get('best_ask') is not None and poly_sum.get('best_bid') is not None) else None,decimals=4)}</div>"
+        f"<div>depth_usd: bids_total={_fmt_float(poly_depth.get('bids_total'),decimals=2,thousands=True)} asks_total={_fmt_float(poly_depth.get('asks_total'),decimals=2,thousands=True)}</div>"
         + _render_levels("Polymarket Book (Yes)", poly_bids, poly_asks)
         + "<hr/>"
         "<h3>Deribit</h3>"
         f"<div>instrument={deribit_target.get('instrument_name')}</div>"
-        f"<div>best_bid={deri_sum.get('best_bid')} best_ask={deri_sum.get('best_ask')} mid={deri_sum.get('mid')}</div>"
+        f"<div>best_bid={_fmt_float(deri_sum.get('best_bid'),decimals=4)} best_ask={_fmt_float(deri_sum.get('best_ask'),decimals=4)} mid={_fmt_float(deri_sum.get('mid'),decimals=4)} spread={_fmt_float(_safe_float(deri_sum.get('best_ask')) - _safe_float(deri_sum.get('best_bid')) if (deri_sum.get('best_ask') is not None and deri_sum.get('best_bid') is not None) else None,decimals=4)}</div>"
+        f"<div>index_price={_fmt_float(deribit_depth.get('index_price'),decimals=2,thousands=True)} depth_usd: bids_total={_fmt_float(deribit_depth.get('bids_total'),decimals=2,thousands=True)} asks_total={_fmt_float(deribit_depth.get('asks_total'),decimals=2,thousands=True)}</div>"
         + _render_levels("Deribit Option Book (Put for < strike)", deri_bids, deri_asks)
         + "<hr/>"
+        "<div><a href='/dashboard'>Dashboard: /dashboard</a></div>"
         "<div><a href='/api/v1/orderbooks'>JSON: /api/v1/orderbooks</a></div>"
         "<div><a href='/api/v1/targets'>JSON: /api/v1/targets</a></div>"
         "</body></html>"
