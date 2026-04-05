@@ -20,6 +20,7 @@ from .orderbook import (
     normalize_polymarket_levels,
     simulate_buy_by_budget,
     simulate_sell_qty,
+    solve_n_range,
     summarize_levels,
 )
 
@@ -39,6 +40,8 @@ _collector_rows: deque[dict[str, Any]] = deque(maxlen=int(os.getenv("PDA_COLLECT
 _collector_config: dict[str, Any] | None = None
 _collector_entry: dict[str, Any] | None = None
 _collector_last_error: str | None = None
+_shadow_trades: dict[str, dict[str, Any]] = {}
+_shadow_trade_seq = 0
 
 
 def _parse_date(d: str) -> date:
@@ -79,7 +82,7 @@ def _append_csv_row(path: str, row: dict[str, Any]) -> None:
 
 
 def _collector_loop() -> None:
-    global _collector_config, _collector_entry, _collector_last_error
+    global _collector_config, _collector_entry, _collector_last_error, _shadow_trades, _shadow_trade_seq
 
     poll_s = float(os.getenv("PDA_COLLECTOR_POLL_S", "15"))
     depth = int(os.getenv("PDA_COLLECTOR_DEPTH", str(SETTINGS.book_depth)))
@@ -92,6 +95,10 @@ def _collector_loop() -> None:
     option_type = os.getenv("PDA_DEFAULT_OPTION_TYPE", SETTINGS.default_deribit_option_type)
     poly_budget_usd = float(os.getenv("PDA_POLY_BUDGET_USD", "1500"))
     deribit_budget_usd = float(os.getenv("PDA_DERIBIT_BUDGET_USD", "200"))
+    max_capital_usd = float(os.getenv("PDA_MAX_CAPITAL_USD", str(min(poly_budget_usd, deribit_budget_usd))))
+    delta_s_usd = float(os.getenv("PDA_DELTA_S_USD", "500"))
+    target_profit_pct = float(os.getenv("PDA_TARGET_PROFIT_PCT", "0.03"))
+    max_shadow_trades = int(os.getenv("PDA_MAX_SHADOW_TRADES", "50"))
 
     position_id = f"{currency}-{strike}-{date_iso}"
 
@@ -105,54 +112,45 @@ def _collector_loop() -> None:
             "option_type": option_type,
             "poly_budget_usd": poly_budget_usd,
             "deribit_budget_usd": deribit_budget_usd,
+            "max_capital_usd": max_capital_usd,
+            "delta_s_usd": delta_s_usd,
+            "target_profit_pct": target_profit_pct,
+            "max_shadow_trades": max_shadow_trades,
             "poll_s": poll_s,
             "depth": depth,
             "csv_path": csv_path,
         }
         _collector_entry = None
         _collector_last_error = None
+        _shadow_trades = {}
+        _shadow_trade_seq = 0
 
     try:
         expiry = _parse_date(date_iso)
         instrument_name = _deribit.get_instrument(currency=currency, expiry=expiry, strike=strike, option_type=option_type).instrument_name
         resolved = _poly.resolve_from_event_slug(event_slug=event_slug, strike=strike)
         token_id = resolved.yes_token_id
-
-        poly_book = _poly.fetch_order_book(token_id=token_id, depth=depth)
-        deribit_book = _deribit.fetch_order_book(instrument_name=instrument_name, limit=depth)
-
-        poly_bids = normalize_polymarket_levels(poly_book.get("bids", []))
-        poly_asks = normalize_polymarket_levels(poly_book.get("asks", []))
-        poly_bids.sort(key=lambda x: x["price"], reverse=True)
-        poly_asks.sort(key=lambda x: x["price"])
-
-        deri_bids = normalize_ccxt_levels(deribit_book.get("bids", []))
-        deri_asks = normalize_ccxt_levels(deribit_book.get("asks", []))
-        deri_bids.sort(key=lambda x: x["price"], reverse=True)
-        deri_asks.sort(key=lambda x: x["price"])
-
-        deri_index = _safe_float(deribit_book.get("index_price"))
-        deri_budget_btc = (deribit_budget_usd / deri_index) if deri_index else 0.0
-
-        poly_entry = simulate_buy_by_budget(poly_asks, budget_native=poly_budget_usd, usd_multiplier=1.0)
-        deri_entry = simulate_buy_by_budget(deri_asks, budget_native=deri_budget_btc, usd_multiplier=deri_index)
-
-        initial_cost_usd = float(poly_entry.notional_usd or 0.0) + float(deri_entry.notional_usd or 0.0)
+        ev = _poly.fetch_event_by_slug(event_slug=event_slug)
+        poly_end_date_raw = ev.get("endDate") or ev.get("endDateIso") or ""
+        poly_end_dt = None
+        if isinstance(poly_end_date_raw, str) and poly_end_date_raw:
+            try:
+                poly_end_dt = datetime.fromisoformat(poly_end_date_raw.replace("Z", "+00:00"))
+            except Exception:
+                poly_end_dt = None
+        deribit_exp_dt = datetime.fromisoformat(f"{date_iso}T08:00:00+00:00")
+        drift_hours = abs((poly_end_dt - deribit_exp_dt).total_seconds()) / 3600.0 if poly_end_dt is not None else None
 
         with _collector_lock:
             _collector_entry = {
                 "ts_utc": _utc_now_iso(),
                 "position_id": position_id,
+                "poly_event_slug": event_slug,
                 "poly_yes_token_id": token_id,
-                "poly_shares": poly_entry.qty,
-                "poly_avg_ask": poly_entry.avg_price,
-                "poly_entry_cost_usd": float(poly_entry.notional_usd or 0.0),
                 "deribit_instrument": instrument_name,
-                "deribit_contracts": deri_entry.qty,
-                "deribit_avg_ask_btc": deri_entry.avg_price,
-                "deribit_index_price": deri_index,
-                "deribit_entry_cost_usd": float(deri_entry.notional_usd or 0.0),
-                "initial_cost_usd": initial_cost_usd,
+                "poly_end": poly_end_date_raw,
+                "deribit_exp": deribit_exp_dt.isoformat(),
+                "time_drift_hours": drift_hours,
             }
 
         while True:
@@ -181,64 +179,167 @@ def _collector_loop() -> None:
             deri_theta = _safe_float(greeks.get("theta")) if isinstance(greeks, dict) else None
             deribit_prob_above = (1.0 + deri_delta) if deri_delta is not None else None
 
-            poly_exit = simulate_sell_qty(poly_bids, qty_to_sell=float(_collector_entry["poly_shares"]), usd_multiplier=1.0)
-            deri_exit = simulate_sell_qty(deri_bids, qty_to_sell=float(_collector_entry["deribit_contracts"]), usd_multiplier=deri_index)
-            current_value_usd = float(poly_exit.notional_usd or 0.0) + float(deri_exit.notional_usd or 0.0)
-            pnl_usd = current_value_usd - float(_collector_entry["initial_cost_usd"])
-            roi = (pnl_usd / float(_collector_entry["initial_cost_usd"])) if float(_collector_entry["initial_cost_usd"]) > 0 else 0.0
+            poly_l1_ask = poly_asks[0] if poly_asks else None
+            poly_l1_bid = poly_bids[0] if poly_bids else None
+            deri_l1_ask = deri_asks[0] if deri_asks else None
+            deri_l1_bid = deri_bids[0] if deri_bids else None
+
+            poly_ask_price = float(poly_l1_ask["price"]) if poly_l1_ask else None
+            poly_ask_shares = float(poly_l1_ask["size"]) if poly_l1_ask else None
+            poly_ask_depth_usd = (poly_ask_price * poly_ask_shares) if (poly_ask_price is not None and poly_ask_shares is not None) else None
+            poly_bid_price = float(poly_l1_bid["price"]) if poly_l1_bid else None
+
+            deri_ask_price_btc = float(deri_l1_ask["price"]) if deri_l1_ask else None
+            deri_ask_contracts = float(deri_l1_ask["size"]) if deri_l1_ask else None
+            deri_bid_price_btc = float(deri_l1_bid["price"]) if deri_l1_bid else None
+
+            deri_ask_premium_usd = (deri_ask_price_btc * deri_index) if (deri_ask_price_btc is not None and deri_index is not None) else None
+            deri_ask_depth_usd = (deri_ask_premium_usd * deri_ask_contracts) if (deri_ask_premium_usd is not None and deri_ask_contracts is not None) else None
+
+            effective_usd = None
+            if poly_ask_depth_usd is not None and deri_ask_depth_usd is not None:
+                effective_usd = min(float(max_capital_usd), float(poly_ask_depth_usd), float(deri_ask_depth_usd))
+
+            poly_spread_pct = None
+            if poly_sum.mid is not None and poly_spread is not None and poly_sum.mid > 0:
+                poly_spread_pct = float(poly_spread) / float(poly_sum.mid)
+            deri_spread_pct = None
+            if deri_sum.mid is not None and deri_spread_btc is not None and deri_sum.mid > 0:
+                deri_spread_pct = float(deri_spread_btc) / float(deri_sum.mid)
+
+            drift_hours = abs((poly_end_dt - deribit_exp_dt).total_seconds()) / 3600.0 if poly_end_dt is not None else None
+
+            nres = None
+            if poly_ask_price is not None and deri_ask_premium_usd is not None and effective_usd is not None:
+                nres = solve_n_range(
+                    poly_ask_price=poly_ask_price,
+                    deribit_ask_premium_usd=float(deri_ask_premium_usd),
+                    budget_usd=float(effective_usd),
+                    delta_s_usd=float(delta_s_usd),
+                    target_profit_pct=float(target_profit_pct),
+                    deribit_max_contracts=deri_ask_contracts,
+                    prob_above=deribit_prob_above,
+                )
+
+            executable = bool(
+                nres
+                and nres.is_executable
+                and effective_usd is not None
+                and effective_usd >= 100.0
+                and (poly_spread_pct is None or poly_spread_pct <= 0.05)
+                and (deri_spread_pct is None or deri_spread_pct <= 0.05)
+                and (drift_hours is None or drift_hours <= 2.0)
+            )
+
             gap = (poly_sum.mid - deribit_prob_above) if (poly_sum.mid is not None and deribit_prob_above is not None) else None
-
-            poly_buy_1500 = simulate_buy_by_budget(poly_asks, budget_native=1500.0, usd_multiplier=1.0)
-            poly_buy_5000 = simulate_buy_by_budget(poly_asks, budget_native=5000.0, usd_multiplier=1.0)
-
-            note = "normal"
-            if roi >= 0.10:
-                note = "target_reached"
-
-            row: dict[str, Any] = {
-                "ts_utc": ts,
-                "position_id": position_id,
-                "invest_usd": float(_collector_entry["initial_cost_usd"]),
-                "value_now_usd": current_value_usd,
-                "pnl_usd": pnl_usd,
-                "roi_pct": roi * 100.0,
-                "gap": gap,
-                "note": note,
-                "poly_event_slug": event_slug,
-                "poly_yes_token_id": token_id,
-                "poly_entry_cost_usd": float(_collector_entry["poly_entry_cost_usd"]),
-                "poly_entry_shares": float(_collector_entry["poly_shares"]),
-                "poly_best_bid": poly_sum.best_bid,
-                "poly_best_ask": poly_sum.best_ask,
-                "poly_spread": poly_spread,
-                "poly_exit_avg_bid": poly_exit.avg_price,
-                "poly_exit_value_usd": float(poly_exit.notional_usd or 0.0),
-                "poly_exit_levels": poly_exit.levels_touched,
-                "poly_buy_avg_1500": poly_buy_1500.avg_price,
-                "poly_buy_slip_1500": (poly_buy_1500.avg_price - poly_sum.best_ask) if (poly_buy_1500.avg_price is not None and poly_sum.best_ask is not None) else None,
-                "poly_buy_avg_5000": poly_buy_5000.avg_price,
-                "poly_buy_slip_5000": (poly_buy_5000.avg_price - poly_sum.best_ask) if (poly_buy_5000.avg_price is not None and poly_sum.best_ask is not None) else None,
-                "deribit_instrument": instrument_name,
-                "deribit_index_price": deri_index,
-                "deribit_entry_cost_usd": float(_collector_entry["deribit_entry_cost_usd"]),
-                "deribit_entry_contracts": float(_collector_entry["deribit_contracts"]),
-                "deribit_best_bid": deri_sum.best_bid,
-                "deribit_best_ask": deri_sum.best_ask,
-                "deribit_spread_btc": deri_spread_btc,
-                "deribit_spread_usd": (deri_spread_btc * deri_index) if (deri_spread_btc is not None and deri_index is not None) else None,
-                "deribit_exit_avg_bid_btc": deri_exit.avg_price,
-                "deribit_exit_value_usd": float(deri_exit.notional_usd or 0.0),
-                "deribit_exit_levels": deri_exit.levels_touched,
-                "deribit_delta": deri_delta,
-                "deribit_theta": deri_theta,
-                "deribit_prob_above": deribit_prob_above,
-            }
-
             with _collector_lock:
-                _collector_rows.append(row)
-                _collector_last_error = None
-            if os.getenv("PDA_COLLECTOR_WRITE_CSV", "true").lower() in {"1", "true", "yes"}:
-                _append_csv_row(csv_path, row)
+                _collector_entry = {
+                    **(_collector_entry or {}),
+                    "ts_utc": ts,
+                    "poly_best_bid": poly_sum.best_bid,
+                    "poly_best_ask": poly_sum.best_ask,
+                    "poly_spread_pct": poly_spread_pct,
+                    "deribit_best_bid": deri_sum.best_bid,
+                    "deribit_best_ask": deri_sum.best_ask,
+                    "deribit_spread_pct": deri_spread_pct,
+                    "deribit_index_price": deri_index,
+                    "gap": gap,
+                    "effective_usd": effective_usd,
+                    "poly_l1_ask": poly_ask_price,
+                    "poly_l1_ask_depth_usd": poly_ask_depth_usd,
+                    "deribit_l1_ask_btc": deri_ask_price_btc,
+                    "deribit_l1_ask_premium_usd": deri_ask_premium_usd,
+                    "deribit_l1_ask_depth_usd": deri_ask_depth_usd,
+                    "n_range": None if not nres else nres.__dict__,
+                    "is_executable": executable,
+                    "time_drift_hours": drift_hours,
+                    "shadow_trades": len(_shadow_trades),
+                }
+
+            if executable and nres and nres.suggested_n is not None and poly_ask_price is not None and deri_ask_premium_usd is not None and effective_usd is not None:
+                _shadow_trade_seq += 1
+                trade_id = f"{position_id}|{_shadow_trade_seq}"
+                shares = float(effective_usd) / float(poly_ask_price)
+                n = float(nres.suggested_n)
+                cost = float(effective_usd) + n * float(deri_ask_premium_usd)
+                entry = {
+                    "trade_id": trade_id,
+                    "entry_ts_utc": ts,
+                    "position_id": position_id,
+                    "budget_usd": float(effective_usd),
+                    "poly_ask_entry": float(poly_ask_price),
+                    "poly_shares": shares,
+                    "deribit_ask_premium_usd": float(deri_ask_premium_usd),
+                    "deribit_contracts": n,
+                    "initial_cost_usd": cost,
+                    "n_min": nres.n_min,
+                    "n_max": nres.n_max,
+                    "worst_case_roi_pct": nres.worst_case_roi_pct,
+                    "expected_roi_pct": nres.expected_roi_pct,
+                }
+                _shadow_trades[trade_id] = entry
+                if len(_shadow_trades) > max_shadow_trades:
+                    oldest = sorted(_shadow_trades.values(), key=lambda x: x.get("entry_ts_utc", ""))[0]["trade_id"]
+                    _shadow_trades.pop(oldest, None)
+
+            poly_mid = poly_sum.mid
+            deri_mark_btc = _safe_float(deribit_book.get("mark_price")) if isinstance(deribit_book, dict) else None
+            if deri_mark_btc is None:
+                deri_mark_btc = deri_sum.mid
+            deri_mark_usd = (deri_mark_btc * deri_index) if (deri_mark_btc is not None and deri_index is not None) else None
+            deri_bid_usd = (deri_bid_price_btc * deri_index) if (deri_bid_price_btc is not None and deri_index is not None) else None
+
+            for trade in list(_shadow_trades.values()):
+                shares = float(trade["poly_shares"])
+                n = float(trade["deribit_contracts"])
+                cost = float(trade["initial_cost_usd"])
+                mark_value = None
+                real_value = None
+                if poly_mid is not None and deri_mark_usd is not None:
+                    mark_value = shares * float(poly_mid) + n * float(deri_mark_usd)
+                if poly_bid_price is not None and deri_bid_usd is not None:
+                    real_value = shares * float(poly_bid_price) + n * float(deri_bid_usd)
+
+                mark_pnl = (mark_value - cost) if mark_value is not None else None
+                mark_roi = ((mark_pnl / cost) * 100.0) if (mark_pnl is not None and cost > 0) else None
+                real_pnl = (real_value - cost) if real_value is not None else None
+                real_roi = ((real_pnl / cost) * 100.0) if (real_pnl is not None and cost > 0) else None
+
+                row: dict[str, Any] = {
+                    "ts_utc": ts,
+                    "trade_id": trade["trade_id"],
+                    "entry_ts_utc": trade["entry_ts_utc"],
+                    "position_id": position_id,
+                    "budget_usd": trade["budget_usd"],
+                    "poly_ask_entry": trade["poly_ask_entry"],
+                    "deribit_ask_premium_usd": trade["deribit_ask_premium_usd"],
+                    "n_min": trade.get("n_min"),
+                    "n_max": trade.get("n_max"),
+                    "n": trade["deribit_contracts"],
+                    "initial_cost_usd": cost,
+                    "mark_value_usd": mark_value,
+                    "mark_pnl_usd": mark_pnl,
+                    "mark_roi_pct": mark_roi,
+                    "realizable_value_usd": real_value,
+                    "realizable_pnl_usd": real_pnl,
+                    "realizable_roi_pct": real_roi,
+                    "worst_case_roi_pct": trade.get("worst_case_roi_pct"),
+                    "expected_roi_pct": trade.get("expected_roi_pct"),
+                    "gap": gap,
+                    "poly_best_bid": poly_sum.best_bid,
+                    "poly_best_ask": poly_sum.best_ask,
+                    "deribit_best_bid": deri_sum.best_bid,
+                    "deribit_best_ask": deri_sum.best_ask,
+                    "deribit_index_price": deri_index,
+                    "deribit_delta": deri_delta,
+                    "deribit_theta": deri_theta,
+                }
+                with _collector_lock:
+                    _collector_rows.append(row)
+                    _collector_last_error = None
+                if os.getenv("PDA_COLLECTOR_WRITE_CSV", "false").lower() in {"1", "true", "yes"}:
+                    _append_csv_row(csv_path, row)
+
             time.sleep(poll_s)
     except Exception as e:
         with _collector_lock:
@@ -484,12 +585,8 @@ def dashboard() -> HTMLResponse:
       <div class="kpi" id="kpi"></div>
     </div>
     <div class="card" style="margin-top: 12px;">
-      <div><b>收益计算</b></div>
-      <div id="calc" class="mono"></div>
-    </div>
-    <div class="card" style="margin-top: 12px;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div><b>ROI 曲线</b></div>
+        <div><b>Shadow ROI（Mark）曲线</b></div>
         <div>
           <a class="btn" href="/api/v1/collector/export.csv">下载 Excel（CSV）</a>
         </div>
@@ -502,20 +599,23 @@ def dashboard() -> HTMLResponse:
         <thead>
           <tr>
             <th>ts_utc</th>
-            <th>value_now_usd</th>
-            <th>pnl_usd</th>
-            <th>roi_pct</th>
+            <th>trade_id</th>
+            <th>entry_ts_utc</th>
+            <th>mark_roi_pct</th>
+            <th>realizable_roi_pct</th>
+            <th>mark_pnl_usd</th>
+            <th>realizable_pnl_usd</th>
+            <th>worst_case_roi_pct</th>
+            <th>expected_roi_pct</th>
             <th>gap</th>
-            <th>poly_spread</th>
+            <th>n</th>
+            <th>n_min</th>
+            <th>n_max</th>
             <th>poly_best_bid</th>
             <th>poly_best_ask</th>
-            <th>poly_buy_slip_1500</th>
-            <th>poly_buy_slip_5000</th>
             <th>deribit_index</th>
-            <th>deri_spread_usd</th>
             <th>deri_delta</th>
             <th>deri_theta</th>
-            <th>note</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -555,27 +655,32 @@ def dashboard() -> HTMLResponse:
         if (!Number.isFinite(n)) return '';
         return nfPct.format(n) + '%';
       }
-      function setKpi(latest) {
+      function setKpi(scan, latestRow) {
         const el = document.getElementById('kpi');
         el.innerHTML = '';
-        if (!latest) return;
+        if (!scan) return;
+        const nRange = scan.n_range || {};
         const items = [
-          ['position_id', latest.position_id],
-          ['invest_usd', fmtUsd(latest.invest_usd)],
-          ['value_now_usd', fmtUsd(latest.value_now_usd)],
-          ['pnl_usd', fmtUsd(latest.pnl_usd)],
-          ['roi_pct', fmtPct(latest.roi_pct)],
-          ['gap', fmt(latest.gap)],
-          ['poly_best_bid', fmtPx(latest.poly_best_bid)],
-          ['poly_best_ask', fmtPx(latest.poly_best_ask)],
-          ['poly_spread', fmtPx(latest.poly_spread)],
-          ['slip_1500', fmtPx(latest.poly_buy_slip_1500)],
-          ['slip_5000', fmtPx(latest.poly_buy_slip_5000)],
-          ['deribit_index', fmtUsd(latest.deribit_index_price)],
-          ['deri_spread_usd', fmtUsd(latest.deribit_spread_usd)],
-          ['deri_delta', fmt(latest.deribit_delta)],
-          ['deri_theta', fmt(latest.deribit_theta)]
+          ['position_id', scan.position_id],
+          ['event_slug', scan.poly_event_slug],
+          ['is_executable', String(scan.is_executable)],
+          ['effective_usd', fmtUsd(scan.effective_usd)],
+          ['poly_l1_ask', fmtPx(scan.poly_l1_ask)],
+          ['poly_l1_ask_depth_usd', fmtUsd(scan.poly_l1_ask_depth_usd)],
+          ['deribit_l1_ask_premium_usd', fmtUsd(scan.deribit_l1_ask_premium_usd)],
+          ['deribit_l1_ask_depth_usd', fmtUsd(scan.deribit_l1_ask_depth_usd)],
+          ['N_range', nRange && nRange.n_min !== undefined ? (`[${fmt(nRange.n_min)}, ${fmt(nRange.n_max)}]`) : ''],
+          ['suggested_n', nRange && nRange.suggested_n !== undefined ? fmt(nRange.suggested_n) : ''],
+          ['worst_case_roi_pct', nRange && nRange.worst_case_roi_pct !== undefined ? fmtPct(nRange.worst_case_roi_pct) : ''],
+          ['expected_roi_pct', nRange && nRange.expected_roi_pct !== undefined ? fmtPct(nRange.expected_roi_pct) : ''],
+          ['gap', fmt(scan.gap)],
+          ['shadow_trades', String(scan.shadow_trades)]
         ];
+        if (latestRow) {
+          items.push(['last_trade_id', latestRow.trade_id]);
+          items.push(['last_mark_roi', fmtPct(latestRow.mark_roi_pct)]);
+          items.push(['last_real_roi', fmtPct(latestRow.realizable_roi_pct)]);
+        }
         items.forEach(([k,v])=>{
           const d = document.createElement('div');
           const kk = document.createElement('div');
@@ -584,31 +689,10 @@ def dashboard() -> HTMLResponse:
           const vv = document.createElement('div');
           vv.className = 'v';
           vv.textContent = v;
-          if (k === 'pnl_usd' || k === 'roi_pct') {
-            const n = Number(k === 'pnl_usd' ? latest.pnl_usd : latest.roi_pct);
-            if (Number.isFinite(n)) vv.className = 'v ' + (n >= 0 ? 'good' : 'bad');
-          }
           d.appendChild(kk);
           d.appendChild(vv);
           el.appendChild(d);
         });
-      }
-      function setCalc(entry, latest) {
-        const el = document.getElementById('calc');
-        if (!latest || !entry) { el.textContent = ''; return; }
-        const polyExit = Number(latest.poly_exit_value_usd || 0);
-        const deriExit = Number(latest.deribit_exit_value_usd || 0);
-        const invest = Number(latest.invest_usd || 0);
-        const value = Number(latest.value_now_usd || 0);
-        const pnl = Number(latest.pnl_usd || 0);
-        const roi = Number(latest.roi_pct || 0);
-        const lines = [
-          `Cost_initial = poly_entry_cost_usd + deribit_entry_cost_usd = ${fmtUsd(entry.poly_entry_cost_usd)} + ${fmtUsd(entry.deribit_entry_cost_usd)} = ${fmtUsd(invest)}`,
-          `Value_now    = poly_exit_value_usd  + deribit_exit_value_usd  = ${fmtUsd(polyExit)} + ${fmtUsd(deriExit)} = ${fmtUsd(value)}`,
-          `PnL_usd      = Value_now - Cost_initial = ${fmtUsd(value)} - ${fmtUsd(invest)} = ${fmtUsd(pnl)}`,
-          `ROI_pct      = PnL_usd / Cost_initial * 100 = ${fmtUsd(pnl)} / ${fmtUsd(invest)} * 100 = ${fmtPct(roi)}`
-        ];
-        el.textContent = lines.join('\\n');
       }
       function drawChart(points) {
         const c = document.getElementById('chart');
@@ -649,7 +733,7 @@ def dashboard() -> HTMLResponse:
         ctx.lineWidth = 2;
         ctx.stroke();
         ctx.fillStyle = '#333';
-        ctx.fillText('roi_pct', pad+4, pad+12);
+        ctx.fillText('mark_roi_pct', pad+4, pad+12);
         ctx.fillText(fmt(ymin), pad+4, pad+h-2);
         ctx.fillText(fmt(ymax), pad+4, pad+24);
         ctx.fillText('0%', pad + w - 18, y0 - 2);
@@ -664,13 +748,12 @@ def dashboard() -> HTMLResponse:
         document.getElementById('cfg').textContent = JSON.stringify(cfg, null, 2);
         const le = (rows && rows.last_error) || (latest && latest.last_error) || (cfg && cfg.last_error);
         document.getElementById('err').textContent = le ? ('collector_error: ' + le) : '';
-        setKpi(latest.latest);
-        setCalc(cfg.entry, latest.latest);
+        setKpi(cfg.entry, latest.latest);
         const tbody = document.getElementById('rows');
         window.__seen = window.__seen || new Set();
         window.__buf = window.__buf || [];
         (rows.rows || []).forEach(r=>{
-          const k = r.ts_utc + '|' + r.position_id;
+          const k = r.ts_utc + '|' + r.trade_id;
           if (window.__seen.has(k)) return;
           window.__seen.add(k);
           window.__buf.push(r);
@@ -682,20 +765,23 @@ def dashboard() -> HTMLResponse:
           const tr = document.createElement('tr');
           const cols = [
             r.ts_utc,
-            fmtUsd(r.value_now_usd),
-            fmtUsd(r.pnl_usd),
-            fmtPct(r.roi_pct),
+            fmt(r.trade_id),
+            fmt(r.entry_ts_utc),
+            fmtPct(r.mark_roi_pct),
+            fmtPct(r.realizable_roi_pct),
+            fmtUsd(r.mark_pnl_usd),
+            fmtUsd(r.realizable_pnl_usd),
+            fmtPct(r.worst_case_roi_pct),
+            fmtPct(r.expected_roi_pct),
             fmt(r.gap),
-            fmtPx(r.poly_spread),
+            fmt(r.n),
+            fmt(r.n_min),
+            fmt(r.n_max),
             fmtPx(r.poly_best_bid),
             fmtPx(r.poly_best_ask),
-            fmtPx(r.poly_buy_slip_1500),
-            fmtPx(r.poly_buy_slip_5000),
             fmtUsd(r.deribit_index_price),
-            fmtUsd(r.deribit_spread_usd),
             fmt(r.deribit_delta),
-            fmt(r.deribit_theta),
-            fmt(r.note)
+            fmt(r.deribit_theta)
           ];
           cols.forEach(v=>{
             const td = document.createElement('td');
@@ -704,7 +790,7 @@ def dashboard() -> HTMLResponse:
           });
           tbody.appendChild(tr);
         });
-        const chartPoints = window.__buf.slice(-300).map(r=>Number(r.roi_pct || 0));
+        const chartPoints = window.__buf.slice(-300).map(r=>Number(r.mark_roi_pct || 0));
         drawChart(chartPoints);
       }
       tick();

@@ -192,6 +192,16 @@ class PolymarketClient:
             no_token_id=no_token_id,
         )
 
+    def fetch_event_by_slug(self, event_slug: str) -> dict[str, Any]:
+        raw = self._gamma_get("/events", params={"slug": event_slug})
+        events = raw if isinstance(raw, list) else raw.get("events") if isinstance(raw, dict) else []
+        if not isinstance(events, list) or not events:
+            raise RuntimeError("Gamma event slug not found")
+        ev = events[0]
+        if not isinstance(ev, dict):
+            raise RuntimeError("Gamma event invalid")
+        return ev
+
     def fetch_order_book(self, token_id: str, depth: int = 15) -> dict[str, Any]:
         r = self._session.get(f"{self._clob_api_base}/book", params={"token_id": token_id}, timeout=self._timeout_s)
         if r.status_code >= 400:
