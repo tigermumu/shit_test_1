@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .clients import DeribitClient, PolymarketClient
 from .config import SETTINGS
@@ -146,10 +146,12 @@ def _collector_loop() -> None:
                 "poly_yes_token_id": token_id,
                 "poly_shares": poly_entry.qty,
                 "poly_avg_ask": poly_entry.avg_price,
+                "poly_entry_cost_usd": float(poly_entry.notional_usd or 0.0),
                 "deribit_instrument": instrument_name,
                 "deribit_contracts": deri_entry.qty,
                 "deribit_avg_ask_btc": deri_entry.avg_price,
                 "deribit_index_price": deri_index,
+                "deribit_entry_cost_usd": float(deri_entry.notional_usd or 0.0),
                 "initial_cost_usd": initial_cost_usd,
             }
 
@@ -204,21 +206,29 @@ def _collector_loop() -> None:
                 "note": note,
                 "poly_event_slug": event_slug,
                 "poly_yes_token_id": token_id,
+                "poly_entry_cost_usd": float(_collector_entry["poly_entry_cost_usd"]),
+                "poly_entry_shares": float(_collector_entry["poly_shares"]),
                 "poly_best_bid": poly_sum.best_bid,
                 "poly_best_ask": poly_sum.best_ask,
                 "poly_spread": poly_spread,
                 "poly_exit_avg_bid": poly_exit.avg_price,
+                "poly_exit_value_usd": float(poly_exit.notional_usd or 0.0),
+                "poly_exit_levels": poly_exit.levels_touched,
                 "poly_buy_avg_1500": poly_buy_1500.avg_price,
                 "poly_buy_slip_1500": (poly_buy_1500.avg_price - poly_sum.best_ask) if (poly_buy_1500.avg_price is not None and poly_sum.best_ask is not None) else None,
                 "poly_buy_avg_5000": poly_buy_5000.avg_price,
                 "poly_buy_slip_5000": (poly_buy_5000.avg_price - poly_sum.best_ask) if (poly_buy_5000.avg_price is not None and poly_sum.best_ask is not None) else None,
                 "deribit_instrument": instrument_name,
                 "deribit_index_price": deri_index,
+                "deribit_entry_cost_usd": float(_collector_entry["deribit_entry_cost_usd"]),
+                "deribit_entry_contracts": float(_collector_entry["deribit_contracts"]),
                 "deribit_best_bid": deri_sum.best_bid,
                 "deribit_best_ask": deri_sum.best_ask,
                 "deribit_spread_btc": deri_spread_btc,
                 "deribit_spread_usd": (deri_spread_btc * deri_index) if (deri_spread_btc is not None and deri_index is not None) else None,
                 "deribit_exit_avg_bid_btc": deri_exit.avg_price,
+                "deribit_exit_value_usd": float(deri_exit.notional_usd or 0.0),
+                "deribit_exit_levels": deri_exit.levels_touched,
                 "deribit_delta": deri_delta,
                 "deribit_theta": deri_theta,
                 "deribit_prob_above": deribit_prob_above,
@@ -315,6 +325,37 @@ def get_collector_rows(limit: int = Query(default=200, ge=1, le=3000)) -> dict[s
     with _collector_lock:
         rows = list(_collector_rows)[-int(limit) :]
         return {"rows": rows, "count": len(_collector_rows), "last_error": _collector_last_error}
+
+@app.get("/api/v1/collector/export.csv")
+def export_collector_csv() -> StreamingResponse:
+    with _collector_lock:
+        rows = list(_collector_rows)
+
+    fieldnames: list[str] = []
+    for r in rows:
+        for k in r.keys():
+            if k not in fieldnames:
+                fieldnames.append(k)
+
+    def _iter() -> Any:
+        yield "\ufeff".encode("utf-8")
+        buf = []
+        import io
+
+        s = io.StringIO()
+        w = csv.DictWriter(s, fieldnames=fieldnames)
+        w.writeheader()
+        yield s.getvalue().encode("utf-8")
+        s.seek(0)
+        s.truncate(0)
+        for r in rows:
+            w.writerow({k: r.get(k) for k in fieldnames})
+            yield s.getvalue().encode("utf-8")
+            s.seek(0)
+            s.truncate(0)
+
+    headers = {"Content-Disposition": 'attachment; filename="pda_collector.csv"'}
+    return StreamingResponse(_iter(), media_type="text/csv; charset=utf-8", headers=headers)
 
 
 @app.get("/api/v1/orderbooks")
@@ -432,6 +473,8 @@ def dashboard() -> HTMLResponse:
       .bad { color: #b00020; }
       .good { color: #006400; }
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      .btn { display: inline-block; padding: 6px 10px; border: 1px solid #ddd; background: #fafafa; text-decoration: none; color: #333; border-radius: 4px; }
+      .btn:hover { background: #f0f0f0; }
     </style>
   </head>
   <body>
@@ -440,18 +483,17 @@ def dashboard() -> HTMLResponse:
       <div><b>KPI</b> <span id="err" class="bad"></span></div>
       <div class="kpi" id="kpi"></div>
     </div>
-    <div class="row">
-      <div class="card">
-        <div><b>Latest</b></div>
-        <div id="latest" class="mono"></div>
-      </div>
-      <div class="card">
-        <div><b>Config</b></div>
-        <div id="cfg" class="mono"></div>
-      </div>
+    <div class="card" style="margin-top: 12px;">
+      <div><b>收益计算</b></div>
+      <div id="calc" class="mono"></div>
     </div>
     <div class="card" style="margin-top: 12px;">
-      <div><b>ROI 曲线</b></div>
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><b>ROI 曲线</b></div>
+        <div>
+          <a class="btn" href="/api/v1/collector/export.csv">下载 Excel（CSV）</a>
+        </div>
+      </div>
       <canvas id="chart" width="1200" height="220"></canvas>
     </div>
     <div class="card" style="margin-top: 12px;">
@@ -478,6 +520,12 @@ def dashboard() -> HTMLResponse:
         </thead>
         <tbody id="rows"></tbody>
       </table>
+    </div>
+    <div class="card" style="margin-top: 12px;">
+      <details>
+        <summary><b>Config（展开查看）</b></summary>
+        <pre id="cfg" class="mono"></pre>
+      </details>
     </div>
     <script>
       const nfUsd = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -545,6 +593,23 @@ def dashboard() -> HTMLResponse:
           el.appendChild(d);
         });
       }
+      function setCalc(entry, latest) {
+        const el = document.getElementById('calc');
+        if (!latest || !entry) { el.textContent = ''; return; }
+        const polyExit = Number(latest.poly_exit_value_usd || 0);
+        const deriExit = Number(latest.deribit_exit_value_usd || 0);
+        const invest = Number(latest.invest_usd || 0);
+        const value = Number(latest.value_now_usd || 0);
+        const pnl = Number(latest.pnl_usd || 0);
+        const roi = Number(latest.roi_pct || 0);
+        const lines = [
+          `Cost_initial = poly_entry_cost_usd + deribit_entry_cost_usd = ${fmtUsd(entry.poly_entry_cost_usd)} + ${fmtUsd(entry.deribit_entry_cost_usd)} = ${fmtUsd(invest)}`,
+          `Value_now    = poly_exit_value_usd  + deribit_exit_value_usd  = ${fmtUsd(polyExit)} + ${fmtUsd(deriExit)} = ${fmtUsd(value)}`,
+          `PnL_usd      = Value_now - Cost_initial = ${fmtUsd(value)} - ${fmtUsd(invest)} = ${fmtUsd(pnl)}`,
+          `ROI_pct      = PnL_usd / Cost_initial * 100 = ${fmtUsd(pnl)} / ${fmtUsd(invest)} * 100 = ${fmtPct(roi)}`
+        ];
+        el.textContent = lines.join('\\n');
+      }
       function drawChart(points) {
         const c = document.getElementById('chart');
         const ctx = c.getContext('2d');
@@ -597,14 +662,23 @@ def dashboard() -> HTMLResponse:
           fetch('/api/v1/collector/rows?limit=200').then(r=>r.json()),
         ]);
         document.getElementById('cfg').textContent = JSON.stringify(cfg, null, 2);
-        document.getElementById('latest').textContent = JSON.stringify(latest, null, 2);
         const le = (rows && rows.last_error) || (latest && latest.last_error) || (cfg && cfg.last_error);
         document.getElementById('err').textContent = le ? ('collector_error: ' + le) : '';
         setKpi(latest.latest);
+        setCalc(cfg.entry, latest.latest);
         const tbody = document.getElementById('rows');
+        window.__seen = window.__seen || new Set();
+        window.__buf = window.__buf || [];
+        (rows.rows || []).forEach(r=>{
+          const k = r.ts_utc + '|' + r.position_id;
+          if (window.__seen.has(k)) return;
+          window.__seen.add(k);
+          window.__buf.push(r);
+        });
+        window.__buf.sort((a,b)=> String(a.ts_utc).localeCompare(String(b.ts_utc)));
+        const renderRows = window.__buf.slice(-500).slice().reverse();
         tbody.innerHTML = '';
-        const rs = (rows.rows || []).slice().reverse().slice(0, 50);
-        rs.forEach(r=>{
+        renderRows.slice(0, 200).forEach(r=>{
           const tr = document.createElement('tr');
           const cols = [
             r.ts_utc,
@@ -630,7 +704,7 @@ def dashboard() -> HTMLResponse:
           });
           tbody.appendChild(tr);
         });
-        const chartPoints = (rows.rows || []).map(r=>Number(r.roi_pct || 0));
+        const chartPoints = window.__buf.slice(-300).map(r=>Number(r.roi_pct || 0));
         drawChart(chartPoints);
       }
       tick();
