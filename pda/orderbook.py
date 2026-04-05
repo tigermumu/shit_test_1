@@ -217,6 +217,62 @@ class NRangeResult:
     reason: str | None
 
 
+@dataclass(frozen=True)
+class CapacityRangeResult:
+    n: float
+    w_min: float | None
+    w_max: float | None
+    w_recommended: float | None
+    is_feasible: bool
+    reason: str | None
+
+
+def solve_w_range_for_n(
+    *,
+    poly_ask_price: float,
+    deribit_ask_premium_usd: float,
+    n: float,
+    delta_s_usd: float,
+    target_profit_pct: float,
+    fees_pct_total: float = 0.0,
+) -> CapacityRangeResult:
+    p = float(poly_ask_price)
+    q = float(deribit_ask_premium_usd)
+    n0 = float(n)
+    ds = float(delta_s_usd)
+    t = float(target_profit_pct)
+    f = float(fees_pct_total)
+
+    if n0 <= 0:
+        return CapacityRangeResult(n0, None, None, None, False, "n<=0")
+    if p <= 0 or p >= 1:
+        return CapacityRangeResult(n0, None, None, None, False, "poly_ask_out_of_range")
+    if q <= 0:
+        return CapacityRangeResult(n0, None, None, None, False, "deribit_premium<=0")
+    if ds <= 0:
+        return CapacityRangeResult(n0, None, None, None, False, "delta_s<=0")
+    if t < 0:
+        return CapacityRangeResult(n0, None, None, None, False, "target_profit_pct<0")
+    if f < 0:
+        return CapacityRangeResult(n0, None, None, None, False, "fees_pct_total<0")
+
+    a = (1.0 / p) - 1.0
+    denom = a - f - t * (1.0 + f)
+    if denom <= 0:
+        return CapacityRangeResult(n0, None, None, None, False, "poly_upside_not_enough_for_target")
+
+    w_min = (n0 * q * (1.0 + f) * (1.0 + t)) / denom
+
+    w_max = n0 * (ds / ((1.0 + f) * (1.0 + t)) - q)
+    if w_max <= 0:
+        return CapacityRangeResult(n0, w_min, w_max, None, False, "premium_too_high_for_protection")
+
+    if w_min >= w_max:
+        return CapacityRangeResult(n0, w_min, w_max, None, False, "no_feasible_w_range")
+
+    return CapacityRangeResult(n0, w_min, w_max, None, True, None)
+
+
 def payoff_pnl_usd(
     *,
     s: float,

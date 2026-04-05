@@ -22,6 +22,7 @@ from .orderbook import (
     simulate_sell_qty,
     payoff_curve,
     payoff_metrics,
+    solve_w_range_for_n,
     solve_n_range,
     summarize_levels,
 )
@@ -104,6 +105,8 @@ def _collector_loop() -> None:
     fees_pct_total = float(os.getenv("PDA_FEES_PCT_TOTAL", "0.0"))
     max_deadzone_loss_pct = float(os.getenv("PDA_MAX_DEADZONE_LOSS_PCT", "0.15"))
     deadzone_max_width_usd = float(os.getenv("PDA_DEADZONE_MAX_WIDTH_USD", "400"))
+    n_step = float(os.getenv("PDA_N_STEP", "0.1"))
+    n_max = float(os.getenv("PDA_N_MAX", "1.0"))
 
     position_id = f"{currency}-{strike}-{date_iso}"
 
@@ -124,6 +127,8 @@ def _collector_loop() -> None:
             "fees_pct_total": fees_pct_total,
             "max_deadzone_loss_pct": max_deadzone_loss_pct,
             "deadzone_max_width_usd": deadzone_max_width_usd,
+            "n_step": n_step,
+            "n_max": n_max,
             "poll_s": poll_s,
             "depth": depth,
             "csv_path": csv_path,
@@ -208,6 +213,62 @@ def _collector_loop() -> None:
             if poly_ask_depth_usd is not None and deri_ask_depth_usd is not None:
                 effective_usd = min(float(max_capital_usd), float(poly_ask_depth_usd), float(deri_ask_depth_usd))
 
+            poly_w_available = min(float(max_capital_usd), float(poly_ask_depth_usd)) if poly_ask_depth_usd is not None else None
+            capacity_probe = []
+            if poly_ask_price is not None and deri_ask_premium_usd is not None and deri_ask_contracts is not None and poly_w_available is not None:
+                max_n_here = min(float(deri_ask_contracts), float(n_max))
+                step = float(n_step) if float(n_step) > 0 else 0.1
+                n_val = step
+                while n_val <= max_n_here + 1e-9:
+                    r = solve_w_range_for_n(
+                        poly_ask_price=float(poly_ask_price),
+                        deribit_ask_premium_usd=float(deri_ask_premium_usd),
+                        n=float(n_val),
+                        delta_s_usd=float(delta_s_usd),
+                        target_profit_pct=float(target_profit_pct),
+                        fees_pct_total=float(fees_pct_total),
+                    )
+                    if r.is_feasible and r.w_min is not None and r.w_max is not None and poly_w_available >= float(r.w_min):
+                        w_reco = min(float(poly_w_available), float(r.w_max))
+                        shares = w_reco / float(poly_ask_price)
+                        fee_usd = float(fees_pct_total) * (w_reco + float(n_val) * float(deri_ask_premium_usd))
+                        curve = payoff_curve(
+                            k=float(strike),
+                            shares=shares,
+                            w=w_reco,
+                            n=float(n_val),
+                            premium_usd=float(deri_ask_premium_usd),
+                            fees_usd=fee_usd,
+                            s_min=float(strike) * 0.9,
+                            s_max=float(strike) * 1.1,
+                            step=float(strike) * 0.01,
+                        )
+                        metrics = payoff_metrics(curve=curve, k=float(strike), current_price=deri_index)
+                        plateau_profit = (shares - w_reco) - float(n_val) * float(deri_ask_premium_usd) - fee_usd
+                        max_loss = metrics.get("max_loss_usd")
+                        score = None
+                        if deribit_prob_above is not None and max_loss is not None and float(max_loss) > 0:
+                            pa = float(deribit_prob_above)
+                            if 0.0 <= pa <= 1.0:
+                                score = (float(plateau_profit) * pa) / float(max_loss)
+                        capacity_probe.append(
+                            {
+                                "n": float(n_val),
+                                "w_min": float(r.w_min),
+                                "w_max": float(r.w_max),
+                                "w_recommended": float(w_reco),
+                                "plateau_profit_usd": float(plateau_profit),
+                                "plateau_roi_pct": (float(plateau_profit) / (w_reco + float(n_val) * float(deri_ask_premium_usd) + fee_usd) * 100.0) if (w_reco + float(n_val) * float(deri_ask_premium_usd) + fee_usd) > 0 else None,
+                                "max_loss_usd": max_loss,
+                                "deadzone_width_usd": metrics.get("deadzone_width_usd"),
+                                "lower_breakeven": metrics.get("lower_breakeven"),
+                                "score": score,
+                            }
+                        )
+                    n_val += step
+                capacity_probe.sort(key=lambda x: (x.get("score") is not None, x.get("score") or -1e18, x.get("w_recommended") or 0.0), reverse=True)
+                capacity_probe = capacity_probe[:8]
+
             poly_spread_pct = None
             if poly_sum.mid is not None and poly_spread is not None and poly_sum.mid > 0:
                 poly_spread_pct = float(poly_spread) / float(poly_sum.mid)
@@ -257,6 +318,7 @@ def _collector_loop() -> None:
                     "deribit_index_price": deri_index,
                     "gap": gap,
                     "effective_usd": effective_usd,
+                    "poly_w_available": poly_w_available,
                     "poly_l1_ask": poly_ask_price,
                     "poly_l1_ask_depth_usd": poly_ask_depth_usd,
                     "deribit_l1_ask_btc": deri_ask_price_btc,
@@ -266,6 +328,7 @@ def _collector_loop() -> None:
                     "is_executable": executable,
                     "time_drift_hours": drift_hours,
                     "shadow_trades": len(_shadow_trades),
+                    "capacity_probe": capacity_probe,
                 }
 
             if executable and nres and nres.suggested_n is not None and poly_ask_price is not None and deri_ask_premium_usd is not None and effective_usd is not None:
@@ -483,38 +546,75 @@ def export_collector_csv() -> StreamingResponse:
 @app.get("/api/v1/payoff")
 def get_payoff(
     trade_id: str | None = Query(default=None),
+    n_override: float | None = Query(default=None, gt=0.0),
+    w_override: float | None = Query(default=None, gt=0.0),
+    poly_ask_override: float | None = Query(default=None, gt=0.0, lt=1.0),
+    deribit_premium_override: float | None = Query(default=None, gt=0.0),
+    delta_s_override: float | None = Query(default=None, gt=0.0),
+    strike_override: float | None = Query(default=None, gt=0.0),
     scan_lower: float = Query(default=2000.0, ge=100.0, le=10000.0),
     scan_upper: float = Query(default=1000.0, ge=100.0, le=10000.0),
-    scan_step: float = Query(default=50.0, ge=1.0, le=500.0),
+    scan_step: float = Query(default=50.0, ge=1.0, le=5000.0),
 ) -> dict[str, Any]:
     with _collector_lock:
         entry = _collector_entry.copy() if isinstance(_collector_entry, dict) else None
+        cfg = _collector_config.copy() if isinstance(_collector_config, dict) else None
         trade = _shadow_trades.get(trade_id) if trade_id else None
+        last_err = _collector_last_error
 
     if trade:
-        k = float(trade.get("strike") or SETTINGS.default_strike)
-        w = float(trade.get("budget_usd") or 0.0)
-        p = float(trade.get("poly_ask_entry") or 0.0)
-        shares = float(trade.get("poly_shares") or 0.0)
-        n = float(trade.get("deribit_contracts") or 0.0)
-        q = float(trade.get("deribit_ask_premium_usd") or 0.0)
-        fees_usd = float(trade.get("fees_usd") or 0.0)
+        k = float(strike_override) if strike_override is not None else float(trade.get("strike") or SETTINGS.default_strike)
+        w = float(w_override) if w_override is not None else float(trade.get("budget_usd") or 0.0)
+        p = float(poly_ask_override) if poly_ask_override is not None else float(trade.get("poly_ask_entry") or 0.0)
+        shares = (w / p) if p > 0 else 0.0
+        n = float(n_override) if n_override is not None else float(trade.get("deribit_contracts") or 0.0)
+        q = float(deribit_premium_override) if deribit_premium_override is not None else float(trade.get("deribit_ask_premium_usd") or 0.0)
+        if n_override is not None or w_override is not None:
+            fee_pct = float((cfg or {}).get("fees_pct_total") or 0.0)
+            fees_usd = fee_pct * (w + n * q)
+        else:
+            fees_usd = float(trade.get("fees_usd") or 0.0)
         current_price = _safe_float(entry.get("deribit_index_price")) if entry else None
     else:
         if not entry:
-            raise HTTPException(status_code=503, detail="collector_not_ready")
-        n_range = entry.get("n_range") if isinstance(entry.get("n_range"), dict) else None
-        if not n_range or n_range.get("suggested_n") is None:
-            raise HTTPException(status_code=503, detail="n_range_not_available")
-        k = float(SETTINGS.default_strike)
-        w = float(entry.get("effective_usd") or 0.0)
-        p = float(entry.get("poly_l1_ask") or 0.0)
-        shares = w / p if p > 0 else 0.0
-        n = float(n_range.get("suggested_n") or 0.0)
-        q = float(entry.get("deribit_l1_ask_premium_usd") or 0.0)
-        fee_pct = float((_collector_config or {}).get("fees_pct_total") or 0.0)
-        fees_usd = fee_pct * (w + n * q)
-        current_price = _safe_float(entry.get("deribit_index_price"))
+            if poly_ask_override is None or deribit_premium_override is None or strike_override is None:
+                raise HTTPException(status_code=503, detail={"code": "collector_not_ready", "last_error": last_err})
+            k = float(strike_override)
+            w = float(w_override) if w_override is not None else 0.0
+            p = float(poly_ask_override)
+            q = float(deribit_premium_override)
+            if w <= 0:
+                raise HTTPException(status_code=422, detail={"code": "w_override_required_when_no_collector"})
+            shares = w / p if p > 0 else 0.0
+            n = float(n_override) if n_override is not None else 0.0
+            if n <= 0:
+                raise HTTPException(status_code=422, detail={"code": "n_override_required_when_no_collector"})
+            fee_pct = float((cfg or {}).get("fees_pct_total") or 0.0)
+            fees_usd = fee_pct * (w + n * q)
+            current_price = None
+        else:
+            n_range = entry.get("n_range") if isinstance(entry.get("n_range"), dict) else None
+            if (not n_range or n_range.get("suggested_n") is None) and n_override is None:
+                raise HTTPException(status_code=503, detail={"code": "n_range_not_available", "last_error": last_err})
+            k = float(strike_override) if strike_override is not None else float((cfg or {}).get("strike") or SETTINGS.default_strike)
+            w = float(w_override) if w_override is not None else float(entry.get("effective_usd") or 0.0)
+            p = float(poly_ask_override) if poly_ask_override is not None else float(entry.get("poly_l1_ask") or 0.0)
+            if p <= 0:
+                raise HTTPException(status_code=503, detail={"code": "poly_l1_ask_not_available", "last_error": last_err})
+            shares = w / p if p > 0 else 0.0
+            q = float(deribit_premium_override) if deribit_premium_override is not None else float(entry.get("deribit_l1_ask_premium_usd") or 0.0)
+            if q <= 0:
+                raise HTTPException(status_code=503, detail={"code": "deribit_l1_premium_not_available", "last_error": last_err})
+            if n_override is not None:
+                n = float(n_override)
+            else:
+                n = float(n_range.get("suggested_n") or 0.0)
+            fee_pct = float((cfg or {}).get("fees_pct_total") or 0.0)
+            fees_usd = fee_pct * (w + n * q)
+            current_price = _safe_float(entry.get("deribit_index_price"))
+
+    ds_cfg = float((cfg or {}).get("delta_s_usd") or 500.0)
+    ds = float(delta_s_override) if delta_s_override is not None else ds_cfg
 
     curve = payoff_curve(
         k=k,
@@ -528,6 +628,29 @@ def get_payoff(
         step=float(scan_step),
     )
     metrics = payoff_metrics(curve=curve, k=k, current_price=current_price)
+
+    cost_total = w + n * q + fees_usd
+    pnl_up = (shares - w) - (n * q) - fees_usd
+    pnl_at_k = -cost_total
+    lower_bep = metrics.get("lower_breakeven")
+    safety_gap = (k - float(lower_bep)) if lower_bep is not None else None
+    risk_reward = (pnl_up / abs(pnl_at_k)) if pnl_at_k != 0 else None
+    plateau_roi = (pnl_up / cost_total) * 100.0 if cost_total > 0 else None
+    plateau_positive = bool(pnl_up > 0)
+    gold_lhs = (1.0 / p) - 1.0 if p > 0 else None
+    gold_rhs = (n * q / w) if w > 0 else None
+    gold_ok = bool(gold_lhs is not None and gold_rhs is not None and gold_lhs > gold_rhs)
+
+    w_min = None
+    w_max = None
+    if p > 0 and p < 1 and q > 0 and n > 0:
+        fee_pct = float((cfg or {}).get("fees_pct_total") or 0.0)
+        a = (1.0 / p) - 1.0
+        denom = a - fee_pct
+        if denom > 0:
+            w_min = (n * q * (1.0 + fee_pct)) / denom
+        w_max = n * (ds / (1.0 + fee_pct) - q)
+
     return {
         "trade_id": trade_id,
         "strike": k,
@@ -536,6 +659,26 @@ def get_payoff(
         "fees_usd": fees_usd,
         "curve": [{"s": s, "pnl": pnl} for s, pnl in curve],
         "metrics": metrics,
+        "planner": {
+            "w_poly_usd": w,
+            "shares": shares,
+            "poly_ask_price": p,
+            "premium_usd_per_contract": q,
+            "delta_s_usd": ds,
+            "cost_total_usd": cost_total,
+            "pnl_up_usd": pnl_up,
+            "pnl_up_roi_pct": plateau_roi,
+            "pnl_at_k_usd": pnl_at_k,
+            "lower_breakeven": lower_bep,
+            "safety_gap_usd": safety_gap,
+            "risk_reward_ratio": risk_reward,
+            "plateau_positive": plateau_positive,
+            "golden_lhs": gold_lhs,
+            "golden_rhs": gold_rhs,
+            "golden_ok": gold_ok,
+            "w_min_plateau": w_min,
+            "w_max_safe": w_max,
+        },
     }
 
 
@@ -667,7 +810,6 @@ def dashboard() -> HTMLResponse:
       .newrow { background:#e8f5ff; animation: fadebg 1.8s ease-out; }
       @keyframes fadebg { 0% { background:#e8f5ff; } 100% { background:transparent; } }
     </style>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   </head>
   <body>
     <h2>PDA 实时监控</h2>
@@ -683,11 +825,32 @@ def dashboard() -> HTMLResponse:
     <div class="card" style="margin-top: 12px;">
       <div><b>KPI</b> <span id="err" class="bad"></span></div>
       <div class="kpi" id="kpi"></div>
+      <div id="capacityProbe" style="margin-top:10px;"></div>
+    </div>
+    <div class="card" style="margin-top: 12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><b>Manual Sandbox</b> <span class="k">（手动输入 Poly Ask / Deribit Premium，做套利模拟）</span></div>
+        <div>
+          <a class="btn" href="#" id="sandboxApply">应用到图表</a>
+          <a class="btn" href="#" id="sandboxClear">清空</a>
+        </div>
+      </div>
+      <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:10px;">
+        <span class="pill">Poly Ask: <input id="sbPolyAsk" type="number" step="0.01" min="0" max="1" style="width:110px; padding:4px;" /></span>
+        <span class="pill">Deri Premium (USD): <input id="sbDeriPrem" type="number" step="1" min="0" style="width:140px; padding:4px;" /></span>
+        <span class="pill">ΔS: <input id="sbDeltaS" type="number" step="50" min="0" style="width:110px; padding:4px;" /></span>
+        <span class="pill">N: <input id="sbN" type="number" step="0.1" min="0" style="width:90px; padding:4px;" value="0.1" /></span>
+        <span class="pill">W(USD): <input id="sbW" type="number" step="10" min="0" style="width:120px; padding:4px;" /></span>
+      </div>
+      <div id="sandboxOut" class="mono" style="margin-top:10px;"></div>
     </div>
     <div class="card" style="margin-top: 12px;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <div><b>Payoff Chart</b> <span class="k">selected:</span> <span id="payoffSelected" class="mono">CURRENT</span></div>
         <div>
+          <span class="pill">Manual N: <input id="manualN" type="number" step="0.1" min="0" style="width:110px; padding:4px;" /></span>
+          <span class="pill">Manual W(USD): <input id="manualW" type="number" step="10" min="0" style="width:120px; padding:4px;" /></span>
+          <a class="btn" href="#" id="applyN">应用</a>
           <a class="btn" href="#" id="payoffReset">回到当前盘口</a>
         </div>
       </div>
@@ -809,6 +972,64 @@ def dashboard() -> HTMLResponse:
           el.appendChild(d);
         });
       }
+
+      function renderCapacityProbe(scan) {
+        const el = document.getElementById('capacityProbe');
+        if (!el) return;
+        const rows = scan && scan.capacity_probe ? scan.capacity_probe : [];
+        if (!rows || !rows.length) {
+          el.innerHTML = '';
+          return;
+        }
+        const head = `
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div><b>Optimal Size Suggester</b> <span class="k">（Deribit N=0.1 步长反推 Poly W）</span></div>
+          </div>
+        `;
+        const tableHead = `
+          <table style="margin-top:8px;">
+            <thead>
+              <tr>
+                <th>N</th>
+                <th>W_min</th>
+                <th>W_max</th>
+                <th>W_reco</th>
+                <th>ROI_up</th>
+                <th>MaxLoss</th>
+                <th>DeadZone</th>
+                <th>Score</th>
+              </tr>
+            </thead>
+            <tbody>
+        `;
+        const trs = rows.map(r => {
+          const score = r.score === null || r.score === undefined ? '' : nfNum.format(Number(r.score));
+          const roi = r.plateau_roi_pct === null || r.plateau_roi_pct === undefined ? '' : fmtPct(r.plateau_roi_pct);
+          const cls = (Number(r.score) >= 1.5) ? 'good' : '';
+          return `
+            <tr style="cursor:pointer;" data-n="${r.n}" data-w="${r.w_recommended}">
+              <td>${fmt(r.n)}</td>
+              <td>${fmtUsd(r.w_min)}</td>
+              <td>${fmtUsd(r.w_max)}</td>
+              <td><span class="${cls}">${fmtUsd(r.w_recommended)}</span></td>
+              <td>${roi}</td>
+              <td>${fmtUsd(r.max_loss_usd)}</td>
+              <td>${fmtUsd(r.deadzone_width_usd)}</td>
+              <td><span class="${cls}">${score}</span></td>
+            </tr>
+          `;
+        }).join('');
+        el.innerHTML = head + tableHead + trs + '</tbody></table>';
+        el.querySelectorAll('tr[data-n]').forEach(tr => {
+          tr.onclick = () => {
+            const n = tr.getAttribute('data-n');
+            if (n) document.getElementById('manualN').value = n;
+            const w = tr.getAttribute('data-w');
+            if (w) document.getElementById('manualW').value = w;
+            updatePayoff(window.__payoff.selected);
+          };
+        });
+      }
       function drawChart(points) {
         const c = document.getElementById('chart');
         const ctx = c.getContext('2d');
@@ -855,7 +1076,136 @@ def dashboard() -> HTMLResponse:
         ctx.fillText('10%', pad + w - 24, y10 - 2);
       }
 
-      window.__payoff = window.__payoff || { chart: null, selected: null, lastTradeId: null };
+      window.__payoff = window.__payoff || { selected: null, lastTradeId: null };
+
+      function drawPayoff(points, strike) {
+        const c = document.getElementById('payoff');
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, c.width, c.height);
+        if (!points || !points.length) return;
+
+        const pad = 24;
+        const w = c.width - pad * 2;
+        const h = c.height - pad * 2;
+
+        const xs = points.map(p => p.x);
+        const ys = points.map(p => p.y);
+        let xmin = Math.min(...xs);
+        let xmax = Math.max(...xs);
+        let ymin = Math.min(...ys);
+        let ymax = Math.max(...ys);
+
+        if (typeof strike === 'number' && Number.isFinite(strike) && strike > 0) {
+          xmin = strike * 0.9;
+          xmax = strike * 1.1;
+        }
+
+        const yPad = Math.max(10, (ymax - ymin) * 0.05);
+        ymin -= yPad;
+        ymax += yPad;
+        if (xmax === xmin) xmax = xmin + 1;
+        if (ymax === ymin) ymax = ymin + 1;
+
+        function xToPx(x) { return pad + (w * ((x - xmin) / (xmax - xmin))); }
+        function yToPx(y) { return pad + h - (h * ((y - ymin) / (ymax - ymin))); }
+
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(pad, pad, w, h);
+
+        const y0 = yToPx(0);
+        ctx.beginPath();
+        ctx.moveTo(pad, y0);
+        ctx.lineTo(pad + w, y0);
+        ctx.strokeStyle = '#b00020';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        if (typeof strike === 'number' && Number.isFinite(strike)) {
+          const xk = xToPx(strike);
+          ctx.save();
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(xk, pad);
+          ctx.lineTo(xk, pad + h);
+          ctx.strokeStyle = '#666';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.restore();
+          ctx.fillStyle = '#666';
+          ctx.fillText('K', xk + 4, pad + 12);
+        }
+
+        const xAxisY = pad + h;
+        ctx.beginPath();
+        ctx.moveTo(pad, xAxisY);
+        ctx.lineTo(pad + w, xAxisY);
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        const intFmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
+        const leftTicks = 10;
+        const rightTicks = 10;
+        const stepPct = 0.01;
+        const xStep = (typeof strike === 'number' && Number.isFinite(strike) && strike > 0) ? (strike * stepPct) : ((xmax - xmin) / (leftTicks + rightTicks));
+
+        ctx.fillStyle = '#333';
+        ctx.font = '10px Arial';
+        ctx.textBaseline = 'top';
+
+        function drawTick(x, label) {
+          const px = xToPx(x);
+          ctx.beginPath();
+          ctx.moveTo(px, xAxisY);
+          ctx.lineTo(px, xAxisY + 6);
+          ctx.strokeStyle = '#333';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.save();
+          ctx.translate(px, xAxisY + 8);
+          ctx.rotate(-Math.PI / 4);
+          ctx.textAlign = 'left';
+          ctx.fillText(label, 0, 0);
+          ctx.restore();
+        }
+
+        if (typeof strike === 'number' && Number.isFinite(strike)) {
+          for (let i = leftTicks; i >= 1; i--) {
+            const x = strike - i * xStep;
+            if (x < xmin - 1e-6) continue;
+            drawTick(x, intFmt.format(Math.round(x)));
+          }
+          drawTick(strike, intFmt.format(Math.round(strike)));
+          for (let i = 1; i <= rightTicks; i++) {
+            const x = strike + i * xStep;
+            if (x > xmax + 1e-6) continue;
+            drawTick(x, intFmt.format(Math.round(x)));
+          }
+        } else {
+          for (let i = 0; i <= leftTicks + rightTicks; i++) {
+            const x = xmin + i * ((xmax - xmin) / (leftTicks + rightTicks));
+            drawTick(x, intFmt.format(Math.round(x)));
+          }
+        }
+
+        ctx.beginPath();
+        points.forEach((p, i) => {
+          const px = xToPx(p.x);
+          const py = yToPx(p.y);
+          if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        });
+        ctx.strokeStyle = '#0066cc';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        ctx.fillStyle = '#333';
+        ctx.fillText(`PnL (USD)`, pad + 4, pad + 14);
+        ctx.textAlign = 'left';
+        ctx.fillText(`x: BTC expiry price`, pad + 4, pad + h + 18);
+        ctx.fillText(fmtUsd(ymax), pad + 4, pad + 26);
+        ctx.fillText(fmtUsd(ymin), pad + 4, pad + h - 10);
+      }
 
       function renderPayoff(data) {
         const meta = document.getElementById('payoffMeta');
@@ -863,38 +1213,107 @@ def dashboard() -> HTMLResponse:
         const tradeId = data && data.trade_id ? data.trade_id : null;
         selected.textContent = tradeId || 'CURRENT';
         const m = (data && data.metrics) || {};
-        const lines = [
-          `strike=${fmt(data.strike)} budget_usd=${fmtUsd(data.budget_usd)} n=${fmt(data.n)} fees_usd=${fmtUsd(data.fees_usd)}`,
-          `max_loss_usd=${fmtUsd(m.max_loss_usd)} deadzone_width_usd=${fmtUsd(m.deadzone_width_usd)} lower_bep=${fmt(m.lower_breakeven)} upper_bep=${fmt(m.upper_breakeven)}`
-        ];
-        meta.textContent = lines.join('\\n');
-        const pts = (data.curve || []).map(p => ({ x: Number(p.s), y: Number(p.pnl) }));
-        const ctx = document.getElementById('payoff').getContext('2d');
-        if (!window.__payoff.chart) {
-          window.__payoff.chart = new Chart(ctx, {
-            type: 'line',
-            data: { datasets: [{ label: 'PnL (USD)', data: pts, borderColor: '#0066cc', borderWidth: 2, pointRadius: 0 }] },
-            options: {
-              animation: false,
-              responsive: false,
-              scales: {
-                x: { type: 'linear', title: { display: true, text: 'BTC Expiry Price' } },
-                y: { title: { display: true, text: 'PnL (USD)' } }
-              },
-              plugins: { legend: { display: false } }
-            }
-          });
-        } else {
-          window.__payoff.chart.data.datasets[0].data = pts;
-          window.__payoff.chart.update();
+        const p = (data && data.planner) || {};
+        function vOrDash(v, formatter) {
+          if (v === null || v === undefined) return '-';
+          const n = Number(v);
+          if (Number.isFinite(n)) return formatter ? formatter(n) : String(n);
+          const s = String(v);
+          return s.length ? s : '-';
         }
+        function clsPosNeg(v) {
+          const n = Number(v);
+          if (!Number.isFinite(n)) return '';
+          if (n > 0) return 'good';
+          if (n < 0) return 'bad';
+          return '';
+        }
+        const strike = Number(data && data.strike);
+        const nVal = Number(data && data.n);
+        const budget = Number(data && data.budget_usd);
+        const fees = Number(data && data.fees_usd);
+        const costTotal = Number(p.cost_total_usd);
+        const pnlUp = Number(p.pnl_up_usd);
+        const pnlUpRoi = Number(p.pnl_up_roi_pct);
+        const pnlAtK = Number(p.pnl_at_k_usd);
+        const maxLoss = Number(m.max_loss_usd);
+        const dzWidth = Number(m.deadzone_width_usd);
+
+        const goldenOk = Boolean(p.golden_ok);
+        const goldenLhs = p.golden_lhs;
+        const goldenRhs = p.golden_rhs;
+
+        meta.innerHTML = `
+          <div style="display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;">
+            <div style="border:1px solid #eee; padding:10px;">
+              <div class="k">输入</div>
+              <div><span class="k">K</span> <span class="v">${vOrDash(strike, x => nfUsd.format(Math.round(x)))}</span></div>
+              <div><span class="k">W (USD)</span> <span class="v">${vOrDash(budget, fmtUsd)}</span></div>
+              <div><span class="k">N</span> <span class="v">${vOrDash(nVal, fmt)}</span></div>
+              <div><span class="k">Fees (USD)</span> <span class="v">${vOrDash(fees, fmtUsd)}</span></div>
+            </div>
+            <div style="border:1px solid #eee; padding:10px;">
+              <div class="k">右侧平原（S ≥ K）</div>
+              <div><span class="k">Cost Total</span> <span class="v">${vOrDash(costTotal, fmtUsd)}</span></div>
+              <div><span class="k">PnL_up</span> <span class="v ${clsPosNeg(pnlUp)}">${vOrDash(pnlUp, fmtUsd)}</span></div>
+              <div><span class="k">ROI_up</span> <span class="v ${clsPosNeg(pnlUpRoi)}">${vOrDash(pnlUpRoi, fmtPct)}</span></div>
+            </div>
+            <div style="border:1px solid #eee; padding:10px;">
+              <div class="k">死区与保护</div>
+              <div><span class="k">PnL@K</span> <span class="v bad">${vOrDash(pnlAtK, fmtUsd)}</span></div>
+              <div><span class="k">Max Loss</span> <span class="v bad">${vOrDash(maxLoss, fmtUsd)}</span></div>
+              <div><span class="k">Dead Zone Width</span> <span class="v">${vOrDash(dzWidth, fmtUsd)}</span></div>
+              <div><span class="k">Lower BEP</span> <span class="v">${vOrDash(m.lower_breakeven, fmt)}</span></div>
+              <div><span class="k">Upper BEP</span> <span class="v">${vOrDash(m.upper_breakeven, fmt)}</span></div>
+            </div>
+          </div>
+          <div style="margin-top:10px; border:1px solid #eee; padding:10px;">
+            <div class="k">执行提示</div>
+            <div><span class="k">Safety Gap (K - lower_bep)</span> <span class="v">${vOrDash(p.safety_gap_usd, fmtUsd)}</span></div>
+            <div><span class="k">Risk/Reward</span> <span class="v ${clsPosNeg(p.risk_reward_ratio)}">${vOrDash(p.risk_reward_ratio, fmt)}</span></div>
+            <div><span class="k">Golden Check</span>
+              <span class="v ${goldenOk ? 'good' : 'bad'}">${goldenOk ? 'OK' : 'NO'}</span>
+              <span class="k" style="margin-left:8px;">(1/p-1)=</span><span class="mono">${vOrDash(goldenLhs, fmt)}</span>
+              <span class="k"> &gt; (N*q/W)=</span><span class="mono">${vOrDash(goldenRhs, fmt)}</span>
+            </div>
+          </div>
+        `.trim();
+        const pts = (data.curve || []).map(p => ({ x: Number(p.s), y: Number(p.pnl) })).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+        drawPayoff(pts, Number(data.strike));
       }
 
       async function updatePayoff(tradeId) {
-        const q = tradeId ? ('?trade_id=' + encodeURIComponent(tradeId)) : '';
-        const data = await fetch('/api/v1/payoff' + q).then(r => r.json());
-        renderPayoff(data);
-        window.__payoff.selected = tradeId || null;
+        try {
+          const n = document.getElementById('manualN').value;
+          const nParam = n ? ('&n_override=' + encodeURIComponent(n)) : '';
+          const w = document.getElementById('manualW').value;
+          const wParam = w ? ('&w_override=' + encodeURIComponent(w)) : '';
+          const sbPoly = document.getElementById('sbPolyAsk') ? document.getElementById('sbPolyAsk').value : '';
+          const sbDeri = document.getElementById('sbDeriPrem') ? document.getElementById('sbDeriPrem').value : '';
+          const sbDs = document.getElementById('sbDeltaS') ? document.getElementById('sbDeltaS').value : '';
+          const k = (typeof window.__strike === 'number' && Number.isFinite(window.__strike) && window.__strike > 0) ? window.__strike : 70000;
+          const sandboxParams = (sbPoly && sbDeri)
+            ? (`&poly_ask_override=${encodeURIComponent(sbPoly)}&deribit_premium_override=${encodeURIComponent(sbDeri)}&strike_override=${encodeURIComponent(String(k))}` + (sbDs ? `&delta_s_override=${encodeURIComponent(sbDs)}` : ''))
+            : '';
+          const strike = window.__strike;
+          const scanParams = (typeof strike === 'number' && Number.isFinite(strike) && strike > 0)
+            ? (`&scan_lower=${encodeURIComponent((strike*0.10).toFixed(0))}&scan_upper=${encodeURIComponent((strike*0.10).toFixed(0))}&scan_step=${encodeURIComponent((strike*0.01).toFixed(0))}`)
+            : '';
+          const q = tradeId
+            ? ('?trade_id=' + encodeURIComponent(tradeId) + nParam + wParam + sandboxParams + scanParams)
+            : ('?' + (nParam + wParam + sandboxParams + scanParams).replace(/^&/, ''));
+          const res = await fetch('/api/v1/payoff' + q);
+          const data = await res.json();
+          if (!res.ok) {
+            const msg = (data && data.detail) ? JSON.stringify(data.detail) : ('http_' + res.status);
+            document.getElementById('payoffMeta').textContent = 'payoff_not_ready: ' + msg;
+            return;
+          }
+          renderPayoff(data);
+          window.__payoff.selected = tradeId || null;
+        } catch (e) {
+          document.getElementById('payoffMeta').textContent = 'payoff_fetch_error: ' + String(e);
+        }
       }
 
       async function tick() {
@@ -913,9 +1332,12 @@ def dashboard() -> HTMLResponse:
         const t1 = performance.now();
         document.getElementById('fetchMs').textContent = Math.round(t1 - t0);
         document.getElementById('cfg').textContent = JSON.stringify(cfg, null, 2);
+        window.__strike = cfg && cfg.config ? Number(cfg.config.strike) : undefined;
+        window.__feePct = cfg && cfg.config ? Number(cfg.config.fees_pct_total || 0) : 0;
         const le = (rows && rows.last_error) || (latest && latest.last_error) || (cfg && cfg.last_error);
         document.getElementById('err').textContent = le ? ('collector_error: ' + le) : '';
         setKpi(cfg.entry, latest.latest);
+        renderCapacityProbe(cfg.entry);
         document.getElementById('shadowCount').textContent = cfg && cfg.entry && cfg.entry.shadow_trades ? String(cfg.entry.shadow_trades) : '0';
         const tbody = document.getElementById('rows');
         window.__seen = window.__seen || new Set();
@@ -939,6 +1361,8 @@ def dashboard() -> HTMLResponse:
           tr.style.cursor = 'pointer';
           tr.onclick = () => {
             window.__payoff.selected = r.trade_id;
+            document.getElementById('manualN').value = r.n ? String(r.n) : '';
+            document.getElementById('manualW').value = r.budget_usd ? String(r.budget_usd) : '';
             updatePayoff(r.trade_id);
           };
           const cols = [
@@ -985,8 +1409,18 @@ def dashboard() -> HTMLResponse:
           status.textContent = 'LIVE';
         }
 
-        if (!window.__payoff.selected) {
+        const manualN = document.getElementById('manualN').value;
+        const manualW = document.getElementById('manualW').value;
+        const sbPoly = document.getElementById('sbPolyAsk') ? document.getElementById('sbPolyAsk').value : '';
+        const sbDeri = document.getElementById('sbDeriPrem') ? document.getElementById('sbDeriPrem').value : '';
+        if (window.__payoff.selected) {
+          updatePayoff(window.__payoff.selected);
+        } else if (manualN || manualW || (sbPoly && sbDeri)) {
           updatePayoff(null);
+        } else {
+          const nr = cfg && cfg.entry && cfg.entry.n_range;
+          if (nr && nr.suggested_n) updatePayoff(null);
+          else document.getElementById('payoffMeta').textContent = 'payoff_not_ready: waiting_for_n_range (or use Manual N + 应用)';
         }
       }
       tick();
@@ -1002,10 +1436,78 @@ def dashboard() -> HTMLResponse:
         if (hb && hb.className.indexOf('pulse') === -1) hb.className += ' pulse';
       }, 250);
 
+      function updateSandboxOut() {
+        const out = document.getElementById('sandboxOut');
+        if (!out) return;
+        const p = Number(document.getElementById('sbPolyAsk').value);
+        const q = Number(document.getElementById('sbDeriPrem').value);
+        const ds = Number(document.getElementById('sbDeltaS').value || 500);
+        const n = Number(document.getElementById('sbN').value || 0.1);
+        const w = Number(document.getElementById('sbW').value || 0);
+        const feePct = Number(window.__feePct || 0);
+        if (!(p > 0 && p < 1) || !(q > 0) || !(n > 0) || !(ds > 0)) {
+          out.textContent = '';
+          return;
+        }
+        const a = (1 / p) - 1;
+        const denom = a - feePct;
+        const wMin = denom > 0 ? (n * q * (1 + feePct)) / denom : null;
+        const wMax = n * (ds / (1 + feePct) - q);
+        const wOpt = (wMax && wMax > 0) ? wMax : null;
+        const lines = [
+          `Inputs: poly_ask=${fmtPx(p)} deri_premium_usd=${fmtUsd(q)} ΔS=${fmtUsd(ds)} N=${fmt(n)}`,
+          `W_min (plateau>=0): ${wMin !== null ? fmtUsd(wMin) : '-'}`,
+          `W_max (protected @K-ΔS): ${wMax > 0 ? fmtUsd(wMax) : '-'}`,
+          `W_opt (recommend): ${wOpt !== null ? fmtUsd(wOpt) : '-'}`,
+          `Tip: 点击“应用到图表”会把 N/W 写入右侧 Manual N/W 并画曲线`
+        ];
+        out.textContent = lines.join('\\n');
+      }
+
+      ['sbPolyAsk','sbDeriPrem','sbDeltaS','sbN','sbW'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('input', updateSandboxOut);
+      });
+
+      document.getElementById('sandboxApply').onclick = (e) => {
+        e.preventDefault();
+        updateSandboxOut();
+        const p = Number(document.getElementById('sbPolyAsk').value);
+        const q = Number(document.getElementById('sbDeriPrem').value);
+        const ds = Number(document.getElementById('sbDeltaS').value || 500);
+        const n = Number(document.getElementById('sbN').value || 0.1);
+        if (!(p > 0 && p < 1) || !(q > 0) || !(n > 0) || !(ds > 0)) return;
+        const feePct = Number(window.__feePct || 0);
+        const wMax = n * (ds / (1 + feePct) - q);
+        const w = Number(document.getElementById('sbW').value || 0);
+        document.getElementById('manualN').value = String(n);
+        if (w > 0) document.getElementById('manualW').value = String(w);
+        else if (wMax > 0) document.getElementById('manualW').value = String(Math.floor(wMax));
+        window.__payoff.selected = null;
+        updatePayoff(null);
+      };
+
+      document.getElementById('sandboxClear').onclick = (e) => {
+        e.preventDefault();
+        ['sbPolyAsk','sbDeriPrem','sbDeltaS','sbN','sbW'].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.value = (id === 'sbN') ? '0.1' : '';
+        });
+        document.getElementById('sandboxOut').textContent = '';
+        updatePayoff(window.__payoff.selected);
+      };
+
       document.getElementById('payoffReset').onclick = (e) => {
         e.preventDefault();
         window.__payoff.selected = null;
+        document.getElementById('manualN').value = '';
+        document.getElementById('manualW').value = '';
         updatePayoff(null);
+      };
+
+      document.getElementById('applyN').onclick = (e) => {
+        e.preventDefault();
+        updatePayoff(window.__payoff.selected);
       };
     </script>
   </body>
