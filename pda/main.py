@@ -45,6 +45,9 @@ _collector_entry: dict[str, Any] | None = None
 _collector_last_error: str | None = None
 _shadow_trades: dict[str, dict[str, Any]] = {}
 _shadow_trade_seq = 0
+_delta_trader_enabled = os.getenv("PDA_DELTA_TRADER_ENABLED", "false").lower() in {"1", "true", "yes"}
+_delta_position: dict[str, Any] | None = None
+_delta_series: deque[dict[str, Any]] = deque(maxlen=int(os.getenv("PDA_DELTA_SERIES_MAX_POINTS", "600")))
 
 
 def _parse_date(d: str) -> date:
@@ -85,7 +88,7 @@ def _append_csv_row(path: str, row: dict[str, Any]) -> None:
 
 
 def _collector_loop() -> None:
-    global _collector_config, _collector_entry, _collector_last_error, _shadow_trades, _shadow_trade_seq
+    global _collector_config, _collector_entry, _collector_last_error, _shadow_trades, _shadow_trade_seq, _delta_trader_enabled, _delta_position, _delta_series
 
     poll_s = float(os.getenv("PDA_COLLECTOR_POLL_S", "15"))
     depth = int(os.getenv("PDA_COLLECTOR_DEPTH", str(SETTINGS.book_depth)))
@@ -107,6 +110,9 @@ def _collector_loop() -> None:
     deadzone_max_width_usd = float(os.getenv("PDA_DEADZONE_MAX_WIDTH_USD", "400"))
     n_step = float(os.getenv("PDA_N_STEP", "0.1"))
     n_max = float(os.getenv("PDA_N_MAX", "1.0"))
+    delta_gap_threshold = float(os.getenv("PDA_DELTA_GAP_THRESHOLD", "0.01"))
+    delta_profit_target_pct = float(os.getenv("PDA_DELTA_PROFIT_TARGET_PCT", "0.05"))
+    delta_n_fixed = float(os.getenv("PDA_DELTA_N_FIXED", "0.1"))
 
     position_id = f"{currency}-{strike}-{date_iso}"
 
@@ -129,6 +135,9 @@ def _collector_loop() -> None:
             "deadzone_max_width_usd": deadzone_max_width_usd,
             "n_step": n_step,
             "n_max": n_max,
+            "delta_gap_threshold": delta_gap_threshold,
+            "delta_profit_target_pct": delta_profit_target_pct,
+            "delta_n_fixed": delta_n_fixed,
             "poll_s": poll_s,
             "depth": depth,
             "csv_path": csv_path,
@@ -137,6 +146,8 @@ def _collector_loop() -> None:
         _collector_last_error = None
         _shadow_trades = {}
         _shadow_trade_seq = 0
+        _delta_position = None
+        _delta_series = deque(maxlen=_delta_series.maxlen)
 
     try:
         expiry = _parse_date(date_iso)
@@ -191,6 +202,10 @@ def _collector_loop() -> None:
             deri_delta = _safe_float(greeks.get("delta")) if isinstance(greeks, dict) else None
             deri_theta = _safe_float(greeks.get("theta")) if isinstance(greeks, dict) else None
             deribit_prob_above = (1.0 + deri_delta) if deri_delta is not None else None
+            deribit_delta_abs = abs(float(deri_delta)) if deri_delta is not None else None
+            delta_ref_prob = None
+            if deribit_delta_abs is not None:
+                delta_ref_prob = max(0.0, min(1.0, 1.0 - float(deribit_delta_abs)))
 
             poly_l1_ask = poly_asks[0] if poly_asks else None
             poly_l1_bid = poly_bids[0] if poly_bids else None
@@ -208,6 +223,26 @@ def _collector_loop() -> None:
 
             deri_ask_premium_usd = (deri_ask_price_btc * deri_index) if (deri_ask_price_btc is not None and deri_index is not None) else None
             deri_ask_depth_usd = (deri_ask_premium_usd * deri_ask_contracts) if (deri_ask_premium_usd is not None and deri_ask_contracts is not None) else None
+
+            delta_gap = abs(float(poly_ask_price) - float(delta_ref_prob)) if (poly_ask_price is not None and delta_ref_prob is not None) else None
+            delta_entry_readiness = None
+            if delta_gap is not None and delta_gap_threshold > 0:
+                delta_entry_readiness = max(0.0, min(1.0, 1.0 - float(delta_gap) / float(delta_gap_threshold)))
+
+            delta_deri_cost_usd = (float(delta_n_fixed) * float(deri_ask_premium_usd)) if (deri_ask_premium_usd is not None) else None
+            delta_poly_shares_needed = (float(delta_deri_cost_usd) / float(poly_ask_price)) if (delta_deri_cost_usd is not None and poly_ask_price is not None and float(poly_ask_price) > 0) else None
+            delta_poly_cost_usd = (float(delta_poly_shares_needed) * float(poly_ask_price)) if (delta_poly_shares_needed is not None and poly_ask_price is not None) else None
+            delta_fees_usd = (float(fees_pct_total) * (float(delta_poly_cost_usd) + float(delta_deri_cost_usd))) if (delta_poly_cost_usd is not None and delta_deri_cost_usd is not None) else None
+            delta_total_entry_cost_usd = (float(delta_poly_cost_usd) + float(delta_deri_cost_usd) + float(delta_fees_usd)) if (delta_poly_cost_usd is not None and delta_deri_cost_usd is not None and delta_fees_usd is not None) else None
+
+            delta_liquidity_ok = bool(
+                delta_poly_shares_needed is not None
+                and poly_ask_shares is not None
+                and float(poly_ask_shares) >= float(delta_poly_shares_needed)
+                and deri_ask_contracts is not None
+                and float(deri_ask_contracts) >= float(delta_n_fixed)
+            )
+            delta_entry_executable = bool(delta_gap is not None and float(delta_gap) <= float(delta_gap_threshold) and delta_liquidity_ok)
 
             effective_usd = None
             if poly_ask_depth_usd is not None and deri_ask_depth_usd is not None:
@@ -317,6 +352,8 @@ def _collector_loop() -> None:
                     "deribit_spread_pct": deri_spread_pct,
                     "deribit_index_price": deri_index,
                     "gap": gap,
+                    "deribit_delta_abs": deribit_delta_abs,
+                    "delta_ref_prob": delta_ref_prob,
                     "effective_usd": effective_usd,
                     "poly_w_available": poly_w_available,
                     "poly_l1_ask": poly_ask_price,
@@ -324,12 +361,38 @@ def _collector_loop() -> None:
                     "deribit_l1_ask_btc": deri_ask_price_btc,
                     "deribit_l1_ask_premium_usd": deri_ask_premium_usd,
                     "deribit_l1_ask_depth_usd": deri_ask_depth_usd,
+                    "delta_gap": delta_gap,
+                    "delta_entry_readiness": delta_entry_readiness,
+                    "delta_entry_executable": delta_entry_executable,
+                    "delta_poly_shares_needed": delta_poly_shares_needed,
+                    "delta_poly_cost_usd": delta_poly_cost_usd,
+                    "delta_deribit_cost_usd": delta_deri_cost_usd,
+                    "delta_total_entry_cost_usd": delta_total_entry_cost_usd,
+                    "delta_liquidity_ok": delta_liquidity_ok,
                     "n_range": None if not nres else nres.__dict__,
                     "is_executable": executable,
                     "time_drift_hours": drift_hours,
                     "shadow_trades": len(_shadow_trades),
                     "capacity_probe": capacity_probe,
                 }
+
+            if _delta_trader_enabled and _delta_position is None and delta_entry_executable and delta_total_entry_cost_usd is not None:
+                _delta_position = {
+                    "position_id": position_id,
+                    "entry_ts_utc": ts,
+                    "poly_entry_ask": poly_ask_price,
+                    "poly_shares": float(delta_poly_shares_needed) if delta_poly_shares_needed is not None else None,
+                    "poly_entry_cost_usd": float(delta_poly_cost_usd) if delta_poly_cost_usd is not None else None,
+                    "deribit_entry_ask_btc": deri_ask_price_btc,
+                    "deribit_entry_premium_usd": float(deri_ask_premium_usd) if deri_ask_premium_usd is not None else None,
+                    "deribit_contracts": float(delta_n_fixed),
+                    "deribit_entry_cost_usd": float(delta_deri_cost_usd) if delta_deri_cost_usd is not None else None,
+                    "fees_usd": float(delta_fees_usd) if delta_fees_usd is not None else None,
+                    "total_entry_cost_usd": float(delta_total_entry_cost_usd),
+                    "exit_triggered": False,
+                    "exit_trigger_ts_utc": None,
+                }
+                print(f"发现平衡点，建议入场：Poly ${float(delta_poly_cost_usd or 0.0):.2f} USD + Deri {float(delta_n_fixed):.1f}张")
 
             if executable and nres and nres.suggested_n is not None and poly_ask_price is not None and deri_ask_premium_usd is not None and effective_usd is not None:
                 _shadow_trade_seq += 1
@@ -372,6 +435,61 @@ def _collector_loop() -> None:
                 deri_mark_btc = deri_sum.mid
             deri_mark_usd = (deri_mark_btc * deri_index) if (deri_mark_btc is not None and deri_index is not None) else None
             deri_bid_usd = (deri_bid_price_btc * deri_index) if (deri_bid_price_btc is not None and deri_index is not None) else None
+
+            delta_poly_pnl_usd = None
+            delta_deri_pnl_usd = None
+            delta_net_pnl_usd = None
+            delta_realizable_roi_pct = None
+            delta_profit_progress = None
+            delta_exit_trigger = False
+
+            if _delta_position is not None:
+                ps = _safe_float(_delta_position.get("poly_shares"))
+                pc = _safe_float(_delta_position.get("poly_entry_cost_usd"))
+                dn = _safe_float(_delta_position.get("deribit_contracts"))
+                dc = _safe_float(_delta_position.get("deribit_entry_cost_usd"))
+                total_cost = _safe_float(_delta_position.get("total_entry_cost_usd"))
+                if ps is not None and poly_bid_price is not None and pc is not None:
+                    delta_poly_pnl_usd = ps * float(poly_bid_price) - float(pc)
+                if dn is not None and deri_bid_usd is not None and dc is not None:
+                    delta_deri_pnl_usd = dn * float(deri_bid_usd) - float(dc)
+                if delta_poly_pnl_usd is not None and delta_deri_pnl_usd is not None:
+                    delta_net_pnl_usd = float(delta_poly_pnl_usd) + float(delta_deri_pnl_usd)
+                if total_cost is not None and total_cost > 0 and delta_net_pnl_usd is not None:
+                    delta_realizable_roi_pct = (float(delta_net_pnl_usd) / float(total_cost)) * 100.0
+                    delta_profit_progress = max(0.0, min(1.0, (float(delta_realizable_roi_pct) / (float(delta_profit_target_pct) * 100.0)) if float(delta_profit_target_pct) > 0 else 0.0))
+                    if float(delta_realizable_roi_pct) >= float(delta_profit_target_pct) * 100.0:
+                        delta_exit_trigger = True
+                        if not bool(_delta_position.get("exit_triggered")):
+                            _delta_position["exit_triggered"] = True
+                            _delta_position["exit_trigger_ts_utc"] = ts
+                            print("达到 5% 盈利目标，触发模拟平仓")
+
+                _delta_series.append(
+                    {
+                        "ts_utc": ts,
+                        "poly_pnl_usd": delta_poly_pnl_usd,
+                        "deribit_pnl_usd": delta_deri_pnl_usd,
+                        "net_pnl_usd": delta_net_pnl_usd,
+                        "realizable_roi_pct": delta_realizable_roi_pct,
+                        "exit_trigger": delta_exit_trigger,
+                    }
+                )
+
+            with _collector_lock:
+                if isinstance(_collector_entry, dict):
+                    _collector_entry = {
+                        **_collector_entry,
+                        "delta_trader_enabled": _delta_trader_enabled,
+                        "delta_position": _delta_position,
+                        "delta_position_poly_pnl_usd": delta_poly_pnl_usd,
+                        "delta_position_deribit_pnl_usd": delta_deri_pnl_usd,
+                        "delta_position_net_pnl_usd": delta_net_pnl_usd,
+                        "delta_position_realizable_roi_pct": delta_realizable_roi_pct,
+                        "delta_profit_progress": delta_profit_progress,
+                        "delta_exit_trigger": delta_exit_trigger,
+                        "delta_series": list(_delta_series)[-240:],
+                    }
 
             for trade in list(_shadow_trades.values()):
                 shares = float(trade["poly_shares"])
@@ -809,6 +927,11 @@ def dashboard() -> HTMLResponse:
       @keyframes pulse { 0% { transform: scale(0.85); opacity: 0.6; } 50% { transform: scale(1.2); opacity: 1; } 100% { transform: scale(0.85); opacity: 0.6; } }
       .newrow { background:#e8f5ff; animation: fadebg 1.8s ease-out; }
       @keyframes fadebg { 0% { background:#e8f5ff; } 100% { background:transparent; } }
+      .bar { height: 14px; border: 1px solid #ddd; background: #f2f2f2; border-radius: 999px; overflow: hidden; }
+      .bar > div { height: 100%; width: 0%; background: #999; }
+      .barlabel { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:6px; }
+      .barlabel .k { margin:0; }
+      .barlabel .v { font-size: 12px; font-weight: 700; }
     </style>
   </head>
   <body>
@@ -826,6 +949,24 @@ def dashboard() -> HTMLResponse:
       <div><b>KPI</b> <span id="err" class="bad"></span></div>
       <div class="kpi" id="kpi"></div>
       <div id="capacityProbe" style="margin-top:10px;"></div>
+    </div>
+    <div class="card" style="margin-top: 12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><b>Delta-Matching</b> <span class="k">（Entry_Readiness + Profit_Target + 利润扩散监控）</span></div>
+        <div class="mono" id="deltaStatus"></div>
+      </div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top:10px;">
+        <div>
+          <div class="barlabel"><span class="k">Entry_Readiness</span><span id="deltaGapText" class="v mono">-</span></div>
+          <div class="bar"><div id="entryBar"></div></div>
+        </div>
+        <div>
+          <div class="barlabel"><span class="k">Profit_Target</span><span id="deltaRoiText" class="v mono">-</span></div>
+          <div class="bar"><div id="profitBar"></div></div>
+        </div>
+      </div>
+      <div id="deltaNumbers" class="mono" style="margin-top:10px;"></div>
+      <canvas id="deltaChart" width="1200" height="220" style="margin-top:10px;"></canvas>
     </div>
     <div class="card" style="margin-top: 12px;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -1074,6 +1215,113 @@ def dashboard() -> HTMLResponse:
         ctx.fillText(fmt(ymax), pad+4, pad+24);
         ctx.fillText('0%', pad + w - 18, y0 - 2);
         ctx.fillText('10%', pad + w - 24, y10 - 2);
+      }
+
+      function drawDeltaChart(series) {
+        const c = document.getElementById('deltaChart');
+        if (!c) return;
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, c.width, c.height);
+        const rows = (series || []).filter(p => p && (p.net_pnl_usd !== null && p.net_pnl_usd !== undefined));
+        if (!rows.length) return;
+        const pad = 10;
+        const w = c.width - pad * 2;
+        const h = c.height - pad * 2;
+        const poly = rows.map(r => Number(r.poly_pnl_usd || 0));
+        const deri = rows.map(r => Number(r.deribit_pnl_usd || 0));
+        const net = rows.map(r => Number(r.net_pnl_usd || 0));
+        const all = poly.concat(deri).concat(net).filter(n => Number.isFinite(n));
+        if (!all.length) return;
+        const ymin = Math.min(...all);
+        const ymax = Math.max(...all);
+        const ySpan = (ymax - ymin) || 1;
+        ctx.strokeStyle = '#333';
+        ctx.strokeRect(pad, pad, w, h);
+        const y0 = pad + h - (h * ((0 - ymin) / ySpan));
+        ctx.beginPath();
+        ctx.moveTo(pad, y0);
+        ctx.lineTo(pad + w, y0);
+        ctx.strokeStyle = '#ddd';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        function yToPx(y) { return pad + h - (h * ((y - ymin) / ySpan)); }
+        function xToPx(i) { return pad + (w * (i / (rows.length - 1 || 1))); }
+        function strokeLine(arr, color, lw) {
+          ctx.beginPath();
+          arr.forEach((y, i) => {
+            const px = xToPx(i);
+            const py = yToPx(y);
+            if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+          });
+          ctx.strokeStyle = color;
+          ctx.lineWidth = lw;
+          ctx.stroke();
+        }
+        strokeLine(poly, '#0066cc', 1.5);
+        strokeLine(deri, '#ff6f00', 1.5);
+        strokeLine(net, '#2e7d32', 2.5);
+        ctx.fillStyle = '#333';
+        ctx.fillText('Poly PnL', pad + 4, pad + 12);
+        ctx.fillStyle = '#ff6f00';
+        ctx.fillText('Deri PnL', pad + 80, pad + 12);
+        ctx.fillStyle = '#2e7d32';
+        ctx.fillText('Net PnL', pad + 150, pad + 12);
+        ctx.fillStyle = '#333';
+        ctx.fillText(fmtUsd(ymin), pad + 4, pad + h - 2);
+        ctx.fillText(fmtUsd(ymax), pad + 4, pad + 24);
+      }
+
+      function renderDeltaPanel(scan, cfg) {
+        const status = document.getElementById('deltaStatus');
+        const gapText = document.getElementById('deltaGapText');
+        const roiText = document.getElementById('deltaRoiText');
+        const entryBar = document.getElementById('entryBar');
+        const profitBar = document.getElementById('profitBar');
+        const nums = document.getElementById('deltaNumbers');
+        if (!scan || !cfg) return;
+        const th = Number(cfg.delta_gap_threshold || 0.01);
+        const targetPct = Number(cfg.delta_profit_target_pct || 0.05) * 100.0;
+        const gap = scan.delta_gap;
+        const refProb = scan.delta_ref_prob;
+        const polyAsk = scan.poly_l1_ask;
+        const readiness = Number(scan.delta_entry_readiness);
+        const roi = scan.delta_position_realizable_roi_pct;
+        const pProg = Number(scan.delta_profit_progress);
+        const enabled = Boolean(scan.delta_trader_enabled);
+        status.textContent = enabled ? 'ENABLED' : 'DISABLED';
+        if (gapText) {
+          if (gap === null || gap === undefined) gapText.textContent = '-';
+          else gapText.textContent = (`gap=${fmt(gap)} th=${fmt(th)}  poly_ask=${fmt(polyAsk)}  (1-|Δ|)=${fmt(refProb)}`);
+        }
+        if (roiText) roiText.textContent = (roi === null || roi === undefined) ? '-' : (`roi=${fmtPct(roi)} target=${fmtPct(targetPct)}`);
+        if (entryBar) {
+          const w = Number.isFinite(readiness) ? Math.max(0, Math.min(1, readiness)) * 100 : 0;
+          entryBar.style.width = w.toFixed(1) + '%';
+          entryBar.style.background = (w >= 95) ? '#2e7d32' : (w >= 70 ? '#f9a825' : '#999');
+        }
+        if (profitBar) {
+          const w = Number.isFinite(pProg) ? Math.max(0, Math.min(1, pProg)) * 100 : 0;
+          profitBar.style.width = w.toFixed(1) + '%';
+          profitBar.style.background = (w >= 100) ? '#2e7d32' : '#0066cc';
+        }
+        if (nums) {
+          const polyPnl = scan.delta_position_poly_pnl_usd;
+          const deriPnl = scan.delta_position_deribit_pnl_usd;
+          const netPnl = scan.delta_position_net_pnl_usd;
+          const exec = Boolean(scan.delta_entry_executable);
+          const liqOk = Boolean(scan.delta_liquidity_ok);
+          const shares = scan.delta_poly_shares_needed;
+          const cost = scan.delta_total_entry_cost_usd;
+          const exitTrig = Boolean(scan.delta_exit_trigger);
+          const lines = [
+            `Entry executable: ${exec}  Liquidity ok: ${liqOk}`,
+            `Suggested entry: Poly shares=${shares !== null && shares !== undefined ? fmt(shares) : '-'}  Total entry cost=${cost !== null && cost !== undefined ? fmtUsd(cost) : '-'}`,
+            `PnL: Poly=${polyPnl !== null && polyPnl !== undefined ? fmtUsd(polyPnl) : '-'}  Deri=${deriPnl !== null && deriPnl !== undefined ? fmtUsd(deriPnl) : '-'}  Net=${netPnl !== null && netPnl !== undefined ? fmtUsd(netPnl) : '-'}`,
+            exitTrig ? '达到 5% 盈利目标，触发模拟平仓' : ''
+          ].filter(Boolean);
+          nums.textContent = lines.join('\\n');
+        }
+        drawDeltaChart(scan.delta_series || []);
       }
 
       window.__payoff = window.__payoff || { selected: null, lastTradeId: null };
@@ -1338,6 +1586,7 @@ def dashboard() -> HTMLResponse:
         document.getElementById('err').textContent = le ? ('collector_error: ' + le) : '';
         setKpi(cfg.entry, latest.latest);
         renderCapacityProbe(cfg.entry);
+        renderDeltaPanel(cfg.entry, cfg.config);
         document.getElementById('shadowCount').textContent = cfg && cfg.entry && cfg.entry.shadow_trades ? String(cfg.entry.shadow_trades) : '0';
         const tbody = document.getElementById('rows');
         window.__seen = window.__seen || new Set();
