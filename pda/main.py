@@ -48,6 +48,7 @@ _shadow_trade_seq = 0
 _delta_trader_enabled = os.getenv("PDA_DELTA_TRADER_ENABLED", "false").lower() in {"1", "true", "yes"}
 _delta_position: dict[str, Any] | None = None
 _delta_series: deque[dict[str, Any]] = deque(maxlen=int(os.getenv("PDA_DELTA_SERIES_MAX_POINTS", "600")))
+_delta_snapshots: deque[dict[str, Any]] = deque(maxlen=int(os.getenv("PDA_DELTA_SNAPSHOT_MAX_ROWS", "20000")))
 
 
 def _parse_date(d: str) -> date:
@@ -88,11 +89,13 @@ def _append_csv_row(path: str, row: dict[str, Any]) -> None:
 
 
 def _collector_loop() -> None:
-    global _collector_config, _collector_entry, _collector_last_error, _shadow_trades, _shadow_trade_seq, _delta_trader_enabled, _delta_position, _delta_series
+    global _collector_config, _collector_entry, _collector_last_error, _shadow_trades, _shadow_trade_seq, _delta_trader_enabled, _delta_position, _delta_series, _delta_snapshots
 
     poll_s = float(os.getenv("PDA_COLLECTOR_POLL_S", "15"))
     depth = int(os.getenv("PDA_COLLECTOR_DEPTH", str(SETTINGS.book_depth)))
     csv_path = os.getenv("PDA_COLLECTOR_CSV", str(Path.cwd() / "data" / "collector.csv"))
+    delta_snapshot_csv_path = os.getenv("PDA_DELTA_SNAPSHOT_CSV", str(Path.cwd() / "data" / "delta_snapshots.csv"))
+    delta_snapshot_write_csv = os.getenv("PDA_DELTA_SNAPSHOT_WRITE_CSV", "true").lower() in {"1", "true", "yes"}
 
     event_slug = os.getenv("PDA_POLY_EVENT_SLUG", SETTINGS.polymarket_event_slug or "bitcoin-above-on-april-10")
     strike = int(os.getenv("PDA_DEFAULT_STRIKE", str(SETTINGS.default_strike)))
@@ -148,6 +151,7 @@ def _collector_loop() -> None:
         _shadow_trade_seq = 0
         _delta_position = None
         _delta_series = deque(maxlen=_delta_series.maxlen)
+        _delta_snapshots = deque(maxlen=_delta_snapshots.maxlen)
 
     try:
         expiry = _parse_date(date_iso)
@@ -376,6 +380,20 @@ def _collector_loop() -> None:
                     "capacity_probe": capacity_probe,
                 }
 
+            delta_snapshot = {
+                "ts_utc": ts,
+                "poly_best_ask": poly_sum.best_ask,
+                "poly_best_bid": poly_sum.best_bid,
+                "delta_ref_prob": delta_ref_prob,
+                "deribit_best_ask": deri_sum.best_ask,
+                "deribit_best_bid": deri_sum.best_bid,
+                "deribit_index_price": deri_index,
+            }
+            with _collector_lock:
+                _delta_snapshots.append(delta_snapshot)
+            if delta_snapshot_write_csv:
+                _append_csv_row(delta_snapshot_csv_path, delta_snapshot)
+
             if _delta_trader_enabled and _delta_position is None and delta_entry_executable and delta_total_entry_cost_usd is not None:
                 _delta_position = {
                     "position_id": position_id,
@@ -465,16 +483,19 @@ def _collector_loop() -> None:
                             _delta_position["exit_trigger_ts_utc"] = ts
                             print("达到 5% 盈利目标，触发模拟平仓")
 
-                _delta_series.append(
-                    {
-                        "ts_utc": ts,
-                        "poly_pnl_usd": delta_poly_pnl_usd,
-                        "deribit_pnl_usd": delta_deri_pnl_usd,
-                        "net_pnl_usd": delta_net_pnl_usd,
-                        "realizable_roi_pct": delta_realizable_roi_pct,
-                        "exit_trigger": delta_exit_trigger,
-                    }
-                )
+            _delta_series.append(
+                {
+                    "ts_utc": ts,
+                    "poly_ask": poly_ask_price,
+                    "delta_ref_prob": delta_ref_prob,
+                    "delta_gap": delta_gap,
+                    "poly_pnl_usd": delta_poly_pnl_usd,
+                    "deribit_pnl_usd": delta_deri_pnl_usd,
+                    "net_pnl_usd": delta_net_pnl_usd,
+                    "realizable_roi_pct": delta_realizable_roi_pct,
+                    "exit_trigger": delta_exit_trigger,
+                }
+            )
 
             with _collector_lock:
                 if isinstance(_collector_entry, dict):
@@ -628,6 +649,48 @@ def get_collector_rows(limit: int = Query(default=200, ge=1, le=3000)) -> dict[s
     with _collector_lock:
         rows = list(_collector_rows)[-int(limit) :]
         return {"rows": rows, "count": len(_collector_rows), "last_error": _collector_last_error}
+
+
+@app.get("/api/v1/delta_snapshots/rows")
+def get_delta_snapshot_rows(limit: int = Query(default=200, ge=1, le=20000)) -> dict[str, Any]:
+    with _collector_lock:
+        rows = list(_delta_snapshots)[-int(limit) :]
+        return {"rows": rows, "count": len(_delta_snapshots), "last_error": _collector_last_error}
+
+
+@app.get("/api/v1/delta_snapshots/export.csv")
+def export_delta_snapshot_csv() -> StreamingResponse:
+    with _collector_lock:
+        rows = list(_delta_snapshots)
+
+    fieldnames = [
+        "ts_utc",
+        "poly_best_ask",
+        "poly_best_bid",
+        "delta_ref_prob",
+        "deribit_best_ask",
+        "deribit_best_bid",
+        "deribit_index_price",
+    ]
+
+    def _iter() -> Any:
+        yield "\ufeff".encode("utf-8")
+        import io
+
+        s = io.StringIO()
+        w = csv.DictWriter(s, fieldnames=fieldnames)
+        w.writeheader()
+        yield s.getvalue().encode("utf-8")
+        s.seek(0)
+        s.truncate(0)
+        for r in rows:
+            w.writerow({k: r.get(k) for k in fieldnames})
+            yield s.getvalue().encode("utf-8")
+            s.seek(0)
+            s.truncate(0)
+
+    headers = {"Content-Disposition": 'attachment; filename="pda_delta_snapshots.csv"'}
+    return StreamingResponse(_iter(), media_type="text/csv; charset=utf-8", headers=headers)
 
 @app.get("/api/v1/collector/export.csv")
 def export_collector_csv() -> StreamingResponse:
@@ -932,6 +995,7 @@ def dashboard() -> HTMLResponse:
       .barlabel { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:6px; }
       .barlabel .k { margin:0; }
       .barlabel .v { font-size: 12px; font-weight: 700; }
+      .tip { position:absolute; display:none; pointer-events:none; background:rgba(255,255,255,0.96); border:1px solid #ddd; border-radius:6px; padding:6px 8px; font-size:12px; box-shadow:0 2px 10px rgba(0,0,0,0.08); white-space:nowrap; }
     </style>
   </head>
   <body>
@@ -966,7 +1030,34 @@ def dashboard() -> HTMLResponse:
         </div>
       </div>
       <div id="deltaNumbers" class="mono" style="margin-top:10px;"></div>
+      <div id="deltaProbWrap" style="position:relative; margin-top:10px;">
+        <svg id="deltaProbSvg" viewBox="0 0 1200 220" preserveAspectRatio="none" style="width:100%; height:220px;"></svg>
+        <div id="deltaProbTip" class="tip"></div>
+      </div>
       <canvas id="deltaChart" width="1200" height="220" style="margin-top:10px;"></canvas>
+    </div>
+    <div class="card" style="margin-top: 12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><b>Delta Snapshots</b> <span class="k">（15s 采样：Poly / Deribit / Δ 概率对齐）</span></div>
+        <div>
+          <span class="pill">count: <span id="deltaSnapCount">0</span></span>
+          <a class="btn" href="/api/v1/delta_snapshots/export.csv">下载 Excel（CSV）</a>
+        </div>
+      </div>
+      <table style="margin-top:10px;">
+        <thead>
+          <tr>
+            <th>ts_utc</th>
+            <th>poly_best_ask</th>
+            <th>poly_best_bid</th>
+            <th>delta_ref_prob</th>
+            <th>deribit_best_ask</th>
+            <th>deribit_best_bid</th>
+            <th>deribit_index_price</th>
+          </tr>
+        </thead>
+        <tbody id="deltaSnapRows"></tbody>
+      </table>
     </div>
     <div class="card" style="margin-top: 12px;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -1271,6 +1362,165 @@ def dashboard() -> HTMLResponse:
         ctx.fillText(fmtUsd(ymax), pad + 4, pad + 24);
       }
 
+      function drawDeltaProbSvg(series) {
+        const svg = document.getElementById('deltaProbSvg');
+        if (!svg) return;
+        const tip = document.getElementById('deltaProbTip');
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+        const data = (series || []).slice(-240).filter(p => p && (p.poly_ask !== null && p.poly_ask !== undefined) && (p.delta_ref_prob !== null && p.delta_ref_prob !== undefined));
+        if (!data.length) return;
+
+        const poly = data.map(r => Number(r.poly_ask)).map(v => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : NaN));
+        const refp = data.map(r => Number(r.delta_ref_prob)).map(v => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : NaN));
+        const all = poly.concat(refp).filter(v => Number.isFinite(v));
+        if (!all.length) return;
+
+        const minV = Math.min(...all);
+        const maxV = Math.max(...all);
+        let span = maxV - minV;
+        if (!Number.isFinite(span) || span <= 0) span = 0.02;
+        const padV = Math.max(0.005, span * 0.35);
+        let ymin = Math.max(0.0, minV - padV);
+        let ymax = Math.min(1.0, maxV + padV);
+        if (ymax - ymin < 0.02) {
+          const mid = (ymin + ymax) / 2;
+          ymin = Math.max(0.0, mid - 0.01);
+          ymax = Math.min(1.0, mid + 0.01);
+        }
+        const ySpan = (ymax - ymin) || 1;
+
+        const W = 1200, H = 220;
+        const padL = 70, padR = 18, padT = 18, padB = 26;
+        const iw = W - padL - padR;
+        const ih = H - padT - padB;
+
+        function xOf(i) { return padL + iw * (i / (data.length - 1 || 1)); }
+        function yOf(v) { return padT + ih - ih * ((v - ymin) / ySpan); }
+
+        function el(name, attrs) {
+          const n = document.createElementNS('http://www.w3.org/2000/svg', name);
+          if (attrs) Object.keys(attrs).forEach(k => n.setAttribute(k, String(attrs[k])));
+          return n;
+        }
+
+        svg.appendChild(el('rect', { x: 0, y: 0, width: W, height: H, fill: '#fff' }));
+        svg.appendChild(el('rect', { x: padL, y: padT, width: iw, height: ih, fill: 'none', stroke: '#333', 'stroke-width': 1 }));
+
+        const yTicks = 5;
+        for (let i = 0; i <= yTicks; i++) {
+          const v = ymin + (i * (ySpan / yTicks));
+          const y = yOf(v);
+          svg.appendChild(el('line', { x1: padL, y1: y, x2: padL + iw, y2: y, stroke: '#eee', 'stroke-width': 1 }));
+          const t = el('text', { x: 6, y: y + 4, fill: '#666', 'font-size': 11, 'font-family': 'Arial' });
+          t.textContent = v.toFixed(4);
+          svg.appendChild(t);
+        }
+
+        const cPoly = '#0066cc';
+        const cRef = '#f9a825';
+
+        function pathFor(arr) {
+          let d = '';
+          let started = false;
+          arr.forEach((v, i) => {
+            if (!Number.isFinite(v)) return;
+            const x = xOf(i);
+            const y = yOf(v);
+            if (!started) {
+              d += `M${x.toFixed(2)},${y.toFixed(2)}`;
+              started = true;
+            } else {
+              d += ` L${x.toFixed(2)},${y.toFixed(2)}`;
+            }
+          });
+          return d;
+        }
+
+        svg.appendChild(el('path', { d: pathFor(poly), fill: 'none', stroke: cPoly, 'stroke-width': 2.5 }));
+        svg.appendChild(el('path', { d: pathFor(refp), fill: 'none', stroke: cRef, 'stroke-width': 2.5 }));
+
+        const title = el('text', { x: padL + 6, y: 14, fill: '#000', 'font-size': 12, 'font-family': 'Arial' });
+        title.textContent = 'Prob Monitor';
+        svg.appendChild(title);
+
+        function lastFinite(arr) {
+          for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return { i, v: arr[i] };
+          return null;
+        }
+        const lp = lastFinite(poly);
+        const lr = lastFinite(refp);
+
+        const leg1 = el('text', { x: padL + 110, y: 14, fill: cPoly, 'font-size': 12, 'font-family': 'Arial' });
+        leg1.textContent = `poly_ask ${lp ? lp.v.toFixed(4) : ''}`;
+        svg.appendChild(leg1);
+        const leg2 = el('text', { x: padL + 250, y: 14, fill: cRef, 'font-size': 12, 'font-family': 'Arial' });
+        leg2.textContent = `(1-|Δ|) ${lr ? lr.v.toFixed(4) : ''}`;
+        svg.appendChild(leg2);
+
+        function dot(pt, color) {
+          if (!pt) return;
+          svg.appendChild(el('circle', { cx: xOf(pt.i), cy: yOf(pt.v), r: 4, fill: color, stroke: '#fff', 'stroke-width': 1 }));
+        }
+        dot(lp, cPoly);
+        dot(lr, cRef);
+
+        const cross = el('line', { x1: padL, y1: padT, x2: padL, y2: padT + ih, stroke: '#bbb', 'stroke-width': 1, 'stroke-dasharray': '4 3', visibility: 'hidden' });
+        const p1 = el('circle', { cx: 0, cy: 0, r: 4, fill: cPoly, stroke: '#fff', 'stroke-width': 1, visibility: 'hidden' });
+        const p2 = el('circle', { cx: 0, cy: 0, r: 4, fill: cRef, stroke: '#fff', 'stroke-width': 1, visibility: 'hidden' });
+        svg.appendChild(cross);
+        svg.appendChild(p1);
+        svg.appendChild(p2);
+
+        function showTip(show) {
+          if (!tip) return;
+          tip.style.display = show ? 'block' : 'none';
+        }
+
+        svg.onmouseleave = () => {
+          cross.setAttribute('visibility', 'hidden');
+          p1.setAttribute('visibility', 'hidden');
+          p2.setAttribute('visibility', 'hidden');
+          showTip(false);
+        };
+
+        svg.onmousemove = (e) => {
+          const rect = svg.getBoundingClientRect();
+          const x = (e.clientX - rect.left) * (W / rect.width);
+          const clamped = Math.max(padL, Math.min(padL + iw, x));
+          const idx = Math.max(0, Math.min(data.length - 1, Math.round(((clamped - padL) / iw) * (data.length - 1))));
+
+          cross.setAttribute('x1', String(xOf(idx)));
+          cross.setAttribute('x2', String(xOf(idx)));
+          cross.setAttribute('visibility', 'visible');
+
+          const v1 = poly[idx];
+          const v2 = refp[idx];
+          if (Number.isFinite(v1)) {
+            p1.setAttribute('cx', String(xOf(idx)));
+            p1.setAttribute('cy', String(yOf(v1)));
+            p1.setAttribute('visibility', 'visible');
+          } else {
+            p1.setAttribute('visibility', 'hidden');
+          }
+          if (Number.isFinite(v2)) {
+            p2.setAttribute('cx', String(xOf(idx)));
+            p2.setAttribute('cy', String(yOf(v2)));
+            p2.setAttribute('visibility', 'visible');
+          } else {
+            p2.setAttribute('visibility', 'hidden');
+          }
+
+          if (tip) {
+            const ts = data[idx].ts_utc ? String(data[idx].ts_utc) : '';
+            tip.textContent = `${ts}  poly_ask=${Number.isFinite(v1) ? v1.toFixed(4) : '-'}  (1-|Δ|)=${Number.isFinite(v2) ? v2.toFixed(4) : '-'}  gap=${(data[idx].delta_gap !== null && data[idx].delta_gap !== undefined) ? Number(data[idx].delta_gap).toFixed(5) : '-'}`;
+            tip.style.left = Math.min(rect.width - 10, Math.max(10, (e.clientX - rect.left) + 12)) + 'px';
+            tip.style.top = Math.min(rect.height - 10, Math.max(10, (e.clientY - rect.top) - 18)) + 'px';
+            showTip(true);
+          }
+        };
+      }
+
       function renderDeltaPanel(scan, cfg) {
         const status = document.getElementById('deltaStatus');
         const gapText = document.getElementById('deltaGapText');
@@ -1321,7 +1571,9 @@ def dashboard() -> HTMLResponse:
           ].filter(Boolean);
           nums.textContent = lines.join('\\n');
         }
-        drawDeltaChart(scan.delta_series || []);
+        const series = scan.delta_series || [];
+        drawDeltaProbSvg(series);
+        drawDeltaChart(series);
       }
 
       window.__payoff = window.__payoff || { selected: null, lastTradeId: null };
@@ -1572,10 +1824,11 @@ def dashboard() -> HTMLResponse:
         hb.className = 'dot warn pulse';
         status.textContent = 'FETCHING';
 
-        const [cfg, latest, rows] = await Promise.all([
+        const [cfg, latest, rows, deltaSnaps] = await Promise.all([
           fetch('/api/v1/collector/config').then(r=>r.json()),
           fetch('/api/v1/collector/latest').then(r=>r.json()),
           fetch('/api/v1/collector/rows?limit=200').then(r=>r.json()),
+          fetch('/api/v1/delta_snapshots/rows?limit=200').then(r=>r.json()),
         ]);
         const t1 = performance.now();
         document.getElementById('fetchMs').textContent = Math.round(t1 - t0);
@@ -1646,6 +1899,32 @@ def dashboard() -> HTMLResponse:
         const r1 = performance.now();
         document.getElementById('renderMs').textContent = Math.round(r1 - r0);
 
+        const dsBody = document.getElementById('deltaSnapRows');
+        const dsCount = document.getElementById('deltaSnapCount');
+        if (dsCount) dsCount.textContent = String(deltaSnaps && deltaSnaps.count ? deltaSnaps.count : 0);
+        if (dsBody) {
+          const ds = (deltaSnaps && deltaSnaps.rows) ? deltaSnaps.rows.slice().reverse() : [];
+          dsBody.innerHTML = '';
+          ds.slice(0, 200).forEach(r => {
+            const tr = document.createElement('tr');
+            const cols = [
+              r.ts_utc,
+              fmtPx(r.poly_best_ask),
+              fmtPx(r.poly_best_bid),
+              fmt(r.delta_ref_prob),
+              fmtPx(r.deribit_best_ask),
+              fmtPx(r.deribit_best_bid),
+              fmtUsd(r.deribit_index_price),
+            ];
+            cols.forEach(v => {
+              const td = document.createElement('td');
+              td.textContent = v;
+              tr.appendChild(td);
+            });
+            dsBody.appendChild(tr);
+          });
+        }
+
         window.__meta.lastTickAt = Date.now();
         window.__meta.nextAt = window.__meta.lastTickAt + window.__meta.pollMs;
         document.getElementById('lastUpdate').textContent = new Date(window.__meta.lastTickAt).toISOString();
@@ -1673,8 +1952,8 @@ def dashboard() -> HTMLResponse:
         }
       }
       tick();
-      window.__meta = window.__meta || { pollMs: 5000, lastTickAt: 0, nextAt: 0 };
-      window.__meta.pollMs = 5000;
+      window.__meta = window.__meta || { pollMs: 15000, lastTickAt: 0, nextAt: 0 };
+      window.__meta.pollMs = 15000;
       setInterval(tick, window.__meta.pollMs);
       setInterval(() => {
         if (!window.__meta) return;
